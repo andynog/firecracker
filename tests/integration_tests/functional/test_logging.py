@@ -8,7 +8,7 @@ up in the configured logging FIFO.
 import json
 import os
 import re
-from time import strptime
+from time import sleep, strptime
 
 import host_tools.logging as log_tools
 
@@ -136,15 +136,17 @@ def test_dirty_page_metrics(test_microvm_with_api):
         show_log_origin=False,
         options=['LogDirtyPages']
     )
-    assert microvm.api_session.is_good_response(response.status_code)
+    assert microvm.api_session.is_status_no_content(response.status_code)
 
     microvm.start()
 
-    lines = metrics_fifo.sequential_reader(3)
-    for line in lines:
-        assert int(json.loads(line)['memory']['dirty_pages']) >= 0
-        # TODO force metrics flushing and get real data without waiting for
-        # Firecracker to flush periodically.
+    sleep(0.3)
+    response = microvm.actions.put(action_type='FlushMetrics')
+    assert microvm.api_session.is_status_no_content(response.status_code)
+
+    lines = metrics_fifo.sequential_reader(2)
+    assert int(json.loads(lines[0])['memory']['dirty_pages']) == 0
+    assert int(json.loads(lines[1])['memory']['dirty_pages']) > 0
 
 
 def log_file_contains_strings(log_fifo, string_list):
@@ -185,13 +187,13 @@ def test_api_requests_logs(test_microvm_with_api):
         show_log_origin=True,
         options=[]
     )
-    assert response.status_code == 204
+    assert microvm.api_session.is_status_no_content(response.status_code)
 
     expected_log_strings = []
 
     # Check that a Put request on /machine-config is logged.
     response = microvm.machine_cfg.put(vcpu_count=4)
-    assert microvm.api_session.is_good_response(response.status_code)
+    assert microvm.api_session.is_status_no_content(response.status_code)
     # We are not interested in the actual body. Just check that the log
     # message also has the string "body" in it.
     expected_log_strings.append(
@@ -202,7 +204,7 @@ def test_api_requests_logs(test_microvm_with_api):
     # Check that a Get request on /machine-config is logged without the
     # body.
     response = microvm.machine_cfg.get()
-    assert response.status_code == 200
+    assert microvm.api_session.is_status_ok(response.status_code)
     expected_log_strings.append(
         "The API server received a synchronous Get request "
         "on \"/machine-config\"."
@@ -217,24 +219,55 @@ def test_api_requests_logs(test_microvm_with_api):
         }
     }
     response = microvm.mmds.put(json=dummy_json)
-    assert response.status_code == 204
+    assert microvm.api_session.is_status_no_content(response.status_code)
     expected_log_strings.append(
         "The API server received a synchronous Put request on \"/mmds\"."
     )
 
     response = microvm.mmds.patch(json=dummy_json)
-    assert response.status_code == 204
+    assert microvm.api_session.is_status_no_content(response.status_code)
     expected_log_strings.append(
         "The API server received a synchronous Patch request on \"/mmds\"."
     )
 
     response = microvm.mmds.get()
-    assert response.status_code == 200
+    assert microvm.api_session.is_status_ok(response.status_code)
     expected_log_strings.append(
         "The API server received a synchronous Get request on \"/mmds\"."
     )
 
     assert log_file_contains_strings(log_fifo, expected_log_strings)
+
+
+def test_flush_metrics(test_microvm_with_api):
+    """Check the `FlushMetrics` vmm action."""
+    microvm = test_microvm_with_api
+    microvm.spawn()
+    microvm.basic_config()
+
+    # Configure logging.
+    log_fifo_path = os.path.join(microvm.path, 'log_fifo')
+    metrics_fifo_path = os.path.join(microvm.path, 'metrics_fifo')
+    log_fifo = log_tools.Fifo(log_fifo_path)
+    metrics_fifo = log_tools.Fifo(metrics_fifo_path)
+
+    response = microvm.logger.put(
+        log_fifo=microvm.create_jailed_resource(log_fifo.path),
+        metrics_fifo=microvm.create_jailed_resource(metrics_fifo.path)
+    )
+    assert microvm.api_session.is_status_no_content(response.status_code)
+
+    microvm.start()
+
+    # Empty fifo before triggering `FlushMetrics` so that we get accurate data.
+    _ = metrics_fifo.sequential_reader(100)
+
+    how_many_flushes = 3
+    for _ in range(how_many_flushes):
+        response = microvm.actions.put(action_type='FlushMetrics')
+        assert microvm.api_session.is_status_no_content(response.status_code)
+    lines = metrics_fifo.sequential_reader(how_many_flushes)
+    assert len(lines) == how_many_flushes
 
 
 # pylint: disable=W0102
@@ -264,12 +297,15 @@ def _test_log_config(
         show_log_origin=show_origin,
         options=options
     )
-    assert microvm.api_session.is_good_response(response.status_code)
+    assert microvm.api_session.is_status_no_content(response.status_code)
 
     microvm.start()
 
     lines = log_fifo.sequential_reader(20)
-    for line in lines:
+    for idx, line in enumerate(lines):
+        if idx == 0:
+            assert line.startswith("Running Firecracker")
+            continue
         check_log_message(
             line,
             microvm.id,

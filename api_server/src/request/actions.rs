@@ -16,7 +16,9 @@ use vmm::VmmAction;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 enum ActionType {
     BlockDeviceRescan,
+    FlushMetrics,
     InstanceStart,
+    SendCtrlAltDel,
 }
 
 // The model of the json body from a sync request. We use Serde to transform each associated
@@ -43,13 +45,16 @@ fn validate_payload(action_body: &ActionBody) -> Result<(), String> {
                     }
                     Ok(())
                 }
-                None => return Err("Payload is required for block device rescan.".to_string()),
+                None => Err("Payload is required for block device rescan.".to_string()),
             }
         }
-        ActionType::InstanceStart => {
-            // InstanceStart does not have a payload
-            if !action_body.payload.is_none() {
-                return Err("InstanceStart does not support a payload.".to_string());
+        ActionType::FlushMetrics | ActionType::InstanceStart | ActionType::SendCtrlAltDel => {
+            // Neither FlushMetrics nor InstanceStart should have a payload.
+            if action_body.payload.is_some() {
+                return Err(format!(
+                    "{:?} does not support a payload.",
+                    action_body.action_type
+                ));
             }
             Ok(())
         }
@@ -73,10 +78,24 @@ impl IntoParsedRequest for ActionBody {
                     sync_receiver,
                 ))
             }
+            ActionType::FlushMetrics => {
+                let (sync_sender, sync_receiver) = oneshot::channel();
+                Ok(ParsedRequest::Sync(
+                    VmmAction::FlushMetrics(sync_sender),
+                    sync_receiver,
+                ))
+            }
             ActionType::InstanceStart => {
                 let (sync_sender, sync_receiver) = oneshot::channel();
                 Ok(ParsedRequest::Sync(
                     VmmAction::StartMicroVm(sync_sender),
+                    sync_receiver,
+                ))
+            }
+            ActionType::SendCtrlAltDel => {
+                let (sync_sender, sync_receiver) = oneshot::channel();
+                Ok(ParsedRequest::Sync(
+                    VmmAction::SendCtrlAltDel(sync_sender),
                     sync_receiver,
                 ))
             }
@@ -122,6 +141,35 @@ mod tests {
             payload: Some(Value::Bool(false)),
         };
         assert!(validate_payload(&action_body).is_err());
+
+        // Test FlushMetrics.
+        let action_body = ActionBody {
+            action_type: ActionType::FlushMetrics,
+            payload: None,
+        };
+
+        assert!(validate_payload(&action_body).is_ok());
+        // Error case: FlushMetrics with payload.
+        let action_body = ActionBody {
+            action_type: ActionType::FlushMetrics,
+            payload: Some(Value::String("metrics-payload".to_string())),
+        };
+        let res = validate_payload(&action_body);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "FlushMetrics does not support a payload.");
+
+        // Test SendCtrlAltDel.
+        let action_body = ActionBody {
+            action_type: ActionType::SendCtrlAltDel,
+            payload: None,
+        };
+        assert!(validate_payload(&action_body).is_ok());
+        // Error case: SendCtrlAltDel with payload.
+        let action_body = ActionBody {
+            action_type: ActionType::SendCtrlAltDel,
+            payload: Some(Value::String("dummy-payload".to_string())),
+        };
+        assert!(validate_payload(&action_body).is_err());
     }
 
     #[test]
@@ -160,6 +208,50 @@ mod tests {
                 .into_parsed_request(None, Method::Put)
                 .unwrap()
                 .eq(&req));
+        }
+
+        {
+            let json = r#"{
+                "action_type": "SendCtrlAltDel"
+            }"#;
+
+            let (sender, receiver) = oneshot::channel();
+            let req: ParsedRequest =
+                ParsedRequest::Sync(VmmAction::SendCtrlAltDel(sender), receiver);
+            let result: Result<ActionBody, serde_json::Error> = serde_json::from_str(json);
+            assert!(result.is_ok());
+            assert!(result
+                .unwrap()
+                .into_parsed_request(None, Method::Put)
+                .unwrap()
+                .eq(&req));
+        }
+
+        {
+            let json = r#"{
+                "action_type": "FlushMetrics"
+            }"#;
+
+            let (sender, receiver) = oneshot::channel();
+            let req: ParsedRequest = ParsedRequest::Sync(VmmAction::FlushMetrics(sender), receiver);
+            let result: Result<ActionBody, serde_json::Error> = serde_json::from_str(json);
+            assert!(result.is_ok());
+            assert!(result
+                .unwrap()
+                .into_parsed_request(None, Method::Put)
+                .unwrap()
+                .eq(&req));
+
+            let json = r#"{
+                "action_type": "FlushMetrics",
+                "payload": "metrics-payload"
+            }"#;
+
+            let result: Result<ActionBody, serde_json::Error> = serde_json::from_str(json);
+            assert!(result.is_ok());
+            let res = result.unwrap().into_parsed_request(None, Method::Put);
+            assert!(res.is_err());
+            assert!(res == Err("FlushMetrics does not support a payload.".to_string()));
         }
     }
 }

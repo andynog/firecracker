@@ -32,17 +32,22 @@ pub struct LoggerConfig {
     /// Named pipe used as output for metrics.
     pub metrics_fifo: String,
     /// The level of the Logger.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<LoggerLevel>,
+    #[serde(default = "default_level")]
+    pub level: LoggerLevel,
     /// When enabled, the logger will append to the output the severity of the log entry.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub show_level: Option<bool>,
+    #[serde(default)]
+    pub show_level: bool,
     /// When enabled, the logger will append the origin of the log entry.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub show_log_origin: Option<bool>,
+    #[serde(default)]
+    pub show_log_origin: bool,
     /// Additional logging options.
+    #[cfg(target_arch = "x86_64")]
     #[serde(default = "default_log_options")]
     pub options: Value,
+}
+
+fn default_level() -> LoggerLevel {
+    LoggerLevel::Warning
 }
 
 fn default_log_options() -> Value {
@@ -54,13 +59,16 @@ fn default_log_options() -> Value {
 pub enum LoggerConfigError {
     /// Cannot initialize the logger due to bad user input.
     InitializationFailure(String),
+    /// Cannot flush the metrics.
+    FlushMetrics(String),
 }
 
 impl Display for LoggerConfigError {
     fn fmt(&self, f: &mut Formatter) -> Result {
         use self::LoggerConfigError::*;
         match *self {
-            InitializationFailure(ref err_msg) => write!(f, "{}", err_msg),
+            InitializationFailure(ref err_msg) => write!(f, "{}", err_msg.replace("\"", "")),
+            FlushMetrics(ref err_msg) => write!(f, "{}", err_msg.replace("\"", "")),
         }
     }
 }

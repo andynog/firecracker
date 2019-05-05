@@ -18,9 +18,8 @@ import pytest
 
 import host_tools.cargo_build as host  # pylint: disable=import-error
 
-
-COVERAGE_TARGET_PCT = 78.0
-# TODO: Put the coverage in s3 and update it automatically.
+COVERAGE_TARGET_PCT = 84.1
+COVERAGE_MAX_DELTA = 0.01
 
 CARGO_KCOV_REL_PATH = os.path.join(host.CARGO_BUILD_REL_PATH, 'kcov')
 
@@ -35,8 +34,8 @@ KCOV_COVERAGE_REGEX = r'"covered":"(\d+\.\d)"'
 def test_coverage(test_session_root_path, test_session_tmp_path):
     """Test line coverage with kcov.
 
-    The result is extracted from the index.json created by kcov after a
-    coverage run.
+    The result is extracted from the $KCOV_COVERAGE_FILE file created by kcov
+    after a coverage run.
     """
     exclude_pattern = (
         '${CARGO_HOME:-$HOME/.cargo/},'
@@ -73,4 +72,19 @@ def test_coverage(test_session_root_path, test_session_tmp_path):
     with open(coverage_file) as cov_output:
         coverage = float(re.findall(KCOV_COVERAGE_REGEX, cov_output.read())[0])
     print("Coverage is: " + str(coverage))
-    assert coverage >= COVERAGE_TARGET_PCT
+
+    coverage_low_msg = (
+        'Current code coverage is below the target of {}%'
+        .format(COVERAGE_TARGET_PCT)
+    )
+
+    assert coverage >= COVERAGE_TARGET_PCT, coverage_low_msg
+
+    coverage_high_msg = (
+        'Please update the value of COVERAGE_TARGET_PCT '
+        'in test_coverage.py such that current_coverage - '
+        'COVERAGE_TARGET_PCT <= {}'.format(COVERAGE_MAX_DELTA)
+    )
+
+    assert coverage - COVERAGE_TARGET_PCT <= COVERAGE_MAX_DELTA,\
+        coverage_high_msg

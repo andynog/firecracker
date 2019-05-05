@@ -3,7 +3,10 @@
 
 // Basic CPUID Information
 pub mod leaf_0x1 {
+    pub const LEAF_NUM: u32 = 0x1;
+
     pub mod eax {
+
         pub const EXTENDED_FAMILY_ID_SHIFT: u32 = 20;
         pub const EXTENDED_PROCESSOR_MODEL_SHIFT: u32 = 16;
         pub const PROCESSOR_TYPE_SHIFT: u32 = 12;
@@ -12,12 +15,14 @@ pub mod leaf_0x1 {
     }
 
     pub mod ebx {
-        // The (fixed) default APIC ID.
-        pub const APICID_SHIFT: u32 = 24;
-        // Bytes flushed when executing CLFLUSH.
-        pub const CLFLUSH_SIZE_SHIFT: u32 = 8;
-        // The logical processor count.
-        pub const CPU_COUNT_SHIFT: u32 = 16;
+        use bit_helper::BitRange;
+
+        // The bit-range containing the (fixed) default APIC ID.
+        pub const APICID_BITRANGE: BitRange = bit_range!(31, 24);
+        // The bit-range containing the logical processor count.
+        pub const CPU_COUNT_BITRANGE: BitRange = bit_range!(23, 16);
+        // The bit-range containing the number of bytes flushed when executing CLFLUSH.
+        pub const CLFLUSH_SIZE_BITRANGE: BitRange = bit_range!(15, 8);
     }
 
     pub mod ecx {
@@ -43,10 +48,10 @@ pub mod leaf_0x1 {
         pub const PDCM_SHIFT: u32 = 15;
         // 18 = DCA Direct Cache Access (prefetch data from a memory mapped device)
         pub const MOVBE_SHIFT: u32 = 22;
-        pub const TSC_DEADLINE_TIMER_SHIFT: u32 = 24;
+        pub const TSC_DEADLINE_TIMER_BITINDEX: u32 = 24;
         pub const OSXSAVE_SHIFT: u32 = 27;
         // Cpu is running on a hypervisor.
-        pub const HYPERVISOR_SHIFT: u32 = 31;
+        pub const HYPERVISOR_BITINDEX: u32 = 31;
     }
 
     pub mod edx {
@@ -54,35 +59,53 @@ pub mod leaf_0x1 {
         pub const DS_SHIFT: u32 = 21; // Debug Store.
         pub const ACPI_SHIFT: u32 = 22; // Thermal Monitor and Software Controlled Clock Facilities.
         pub const SS_SHIFT: u32 = 27; // Self Snoop
-        pub const HTT_SHIFT: u32 = 28; // Max APIC IDs reserved field is valid
+        pub const HTT: u32 = 28; // Max APIC IDs reserved field is valid
         pub const TM_SHIFT: u32 = 29; // Thermal Monitor.
         pub const PBE_SHIFT: u32 = 31; // Pending Break Enable.
     }
 }
 
+pub mod leaf_cache_parameters {
+    pub mod eax {
+        use bit_helper::BitRange;
+
+        pub const CACHE_LEVEL_BITRANGE: BitRange = bit_range!(7, 5);
+        pub const MAX_CPUS_PER_CORE_BITRANGE: BitRange = bit_range!(25, 14);
+    }
+}
+
 // Deterministic Cache Parameters Leaf
 pub mod leaf_0x4 {
+    pub const LEAF_NUM: u32 = 0x4;
+
     pub mod eax {
-        pub const CACHE_LEVEL: u32 = 5;
-        pub const MAX_ADDR_IDS_SHARING_CACHE: u32 = 14;
-        pub const MAX_ADDR_IDS_IN_PACKAGE: u32 = 26;
+        use bit_helper::BitRange;
+
+        // inherit eax from leaf_cache_parameters
+        pub use cpu_leaf::leaf_cache_parameters::eax::*;
+
+        pub const MAX_CORES_PER_PACKAGE_BITRANGE: BitRange = bit_range!(31, 26);
     }
 }
 
 // Thermal and Power Management Leaf
 pub mod leaf_0x6 {
+    pub const LEAF_NUM: u32 = 0x6;
+
     pub mod eax {
-        pub const TURBO_BOOST_SHIFT: u32 = 1;
+        pub const TURBO_BOOST_BITINDEX: u32 = 1;
     }
 
     pub mod ecx {
         // "Energy Performance Bias" bit.
-        pub const EPB_SHIFT: u32 = 3;
+        pub const EPB_BITINDEX: u32 = 3;
     }
 }
 
 // Structured Extended Feature Flags Enumeration Leaf
 pub mod leaf_0x7 {
+    pub const LEAF_NUM: u32 = 0x7;
+
     pub mod index0 {
         pub mod ebx {
             // 1 = TSC_ADJUST
@@ -135,13 +158,66 @@ pub mod leaf_0x7 {
             pub const SGX_LC_SHIFT: u32 = 30;
             // 31 reserved
         }
+
+        pub mod edx {
+            pub const ARCH_CAPABILITIES_BITINDEX: u32 = 29;
+        }
+    }
+}
+
+pub mod leaf_0xa {
+    pub const LEAF_NUM: u32 = 0xa;
+}
+
+// Extended Topology Leaf
+pub mod leaf_0xb {
+    pub const LEAF_NUM: u32 = 0xb;
+
+    pub const LEVEL_TYPE_INVALID: u32 = 0;
+    pub const LEVEL_TYPE_THREAD: u32 = 1;
+    pub const LEVEL_TYPE_CORE: u32 = 2;
+
+    pub mod eax {
+        use bit_helper::BitRange;
+
+        // The bit-range containing the number of bits to shift right the APIC ID in order to get
+        // the next level APIC ID
+        pub const APICID_BITRANGE: BitRange = bit_range!(4, 0);
+    }
+
+    pub mod ebx {
+        use bit_helper::BitRange;
+
+        // The bit-range containing the number of factory-configured logical processors
+        // at the current cache level
+        pub const NUM_LOGICAL_PROCESSORS_BITRANGE: BitRange = bit_range!(15, 0);
+    }
+
+    pub mod ecx {
+        use bit_helper::BitRange;
+
+        pub const LEVEL_TYPE_BITRANGE: BitRange = bit_range!(15, 8);
+        pub const LEVEL_NUMBER_BITRANGE: BitRange = bit_range!(7, 0);
+    }
+}
+
+pub mod leaf_0x80000000 {
+    pub const LEAF_NUM: u32 = 0x8000_0000;
+
+    pub mod eax {
+        use bit_helper::BitRange;
+
+        pub const LARGEST_EXTENDED_FN_BITRANGE: BitRange = bit_range!(31, 0);
     }
 }
 
 pub mod leaf_0x80000001 {
+    pub const LEAF_NUM: u32 = 0x8000_0001;
+
     pub mod ecx {
-        pub const PREFETCH_SHIFT: u32 = 8; // 3DNow! PREFETCH/PREFETCHW instructions
         pub const LZCNT_SHIFT: u32 = 5; // advanced bit manipulation
+        pub const PREFETCH_SHIFT: u32 = 8; // 3DNow! PREFETCH/PREFETCHW instructions
+        pub const TOPOEXT_INDEX: u32 = 22;
     }
 
     pub mod edx {
@@ -149,12 +225,59 @@ pub mod leaf_0x80000001 {
     }
 }
 
-// Extended Topology Leaf
-pub mod leaf_0xb {
-    pub const LEVEL_TYPE_INVALID: u32 = 0;
-    pub const LEVEL_TYPE_THREAD: u32 = 1;
-    pub const LEVEL_TYPE_CORE: u32 = 2;
+pub mod leaf_0x80000008 {
+    pub const LEAF_NUM: u32 = 0x8000_0008;
+
     pub mod ecx {
-        pub const LEVEL_TYPE_SHIFT: u32 = 8; // Shift for setting level type for leaf 11
+        use bit_helper::BitRange;
+
+        // The number of bits in the initial ApicId value that indicate thread ID within a package
+        // Possible values:
+        // 0-3 -> Reserved
+        // 4 -> 1 Die, up to 16 threads
+        // 5 -> 2 Die, up to 32 threads
+        // 6 -> 3,4 Die, up to 64 threads
+        pub const THREAD_ID_SIZE_BITRANGE: BitRange = bit_range!(15, 12);
+        // The number of threads in the package - 1
+        pub const NUM_THREADS_BITRANGE: BitRange = bit_range!(7, 0);
+    }
+}
+
+// Extended Cache Topology Leaf
+pub mod leaf_0x8000001d {
+    pub const LEAF_NUM: u32 = 0x8000_001d;
+
+    // inherit eax from leaf_cache_parameters
+    pub use cpu_leaf::leaf_cache_parameters::eax;
+}
+
+// Extended APIC ID Leaf
+pub mod leaf_0x8000001e {
+    pub const LEAF_NUM: u32 = 0x8000_001e;
+
+    pub mod eax {
+        use bit_helper::BitRange;
+
+        pub const EXTENDED_APIC_ID_BITRANGE: BitRange = bit_range!(31, 0);
+    }
+
+    pub mod ebx {
+        use bit_helper::BitRange;
+
+        // The number of threads per core - 1
+        pub const THREADS_PER_CORE_BITRANGE: BitRange = bit_range!(15, 8);
+        pub const CORE_ID_BITRANGE: BitRange = bit_range!(7, 0);
+    }
+
+    pub mod ecx {
+        use bit_helper::BitRange;
+
+        // The number of nodes per processor. Possible values:
+        // 0 -> 1 node per processor
+        // 1 -> 2 nodes per processor
+        // 2 -> Reserved
+        // 3 -> 4 nodes per processor
+        pub const NODES_PER_PROCESSOR_BITRANGE: BitRange = bit_range!(10, 8);
+        pub const NODE_ID_BITRANGE: BitRange = bit_range!(7, 0);
     }
 }

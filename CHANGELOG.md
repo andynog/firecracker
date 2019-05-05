@@ -1,8 +1,124 @@
 # Changelog
 
+## [0.16.0]
+
+### Added
+
+- Added [alpha] AMD support.
+- New `devtool` command: `prepare_release`. This updates the Firecracker
+  version, crate dependencies and credits in preparation for a new release.
+- New `devtool` command: `tag`. This creates a new git tag for the specified
+  release number, based on the changelog contents.
+- New doc section about building with glibc.
+
+### Changed
+
+- Dropped the JSON-formatted `context` command-line parameter from Firecracker
+  in favor of individual classic command-line parameters.
+- When running with `jailer` the location of the API socket has changed to
+  `<jail-root-path>/api.socket` (API socket was moved _inside_ the jail).
+- `PUT` and `PATCH` requests on `/mmds` with data containing any value type other
+  than `String`, `Array`, `Object` will return status code 400.
+- Improved multiple error messages.
+- Removed all kernel modules from the recommended kernel config.
+
+### Fixed
+
+- Corrected the seccomp filter when building with glibc.
+
+### Removed
+
+- Removed the `seccomp.bad_syscalls` metric.
+
+## [0.15.2]
+
+### Fixed
+
+- Corrected the conditional compilation of the seccomp rule for `madvise`.
+
+## [0.15.1]
+
+### Fixed
+
+- A `madvise` call issued by the `musl` allocator was added to the seccomp
+  whitelist to prevent Firecracker from terminating abruptly when allocating
+  memory in certain conditions.
+
+## [0.15.0]
+
+### Added
+- New API action: SendCtrlAltDel, used to initiate a graceful shutdown,
+  if the guest has driver support for i8042 and AT Keyboard. See
+  [the docs](docs/api_requests/actions.md#sendctrlaltdel) for details.
+- New metric counting the number of egress packets with a spoofed MAC:
+  `net.tx_spoofed_mac_count`.
+- New API call: `PATCH /network-interfaces/`, used to update the rate limiters
+  on a network interface, after the start of a microVM.
+
+### Changed
+
+- Added missing `vmm_version` field to the InstanceInfo API swagger
+  definition, and marked several other mandatory fields as such.
+- New default command line for guest kernel:
+  `reboot=k panic=1 pci=off nomodules 8250.nr_uarts=0
+  i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd`.
+
+### Fixed
+- virtio-blk: VIRTIO_BLK_T_FLUSH now working as expected.
+- Vsock devices can be attached when starting Firecracker using the jailer.
+- Vsock devices work properly when seccomp filtering is enabled.
+
+## [0.14.0]
+
+### Added
+
+- Documentation for development environment setup on AWS in
+  `dev-machine-setup.md`.
+- Documentation for microVM networking setup in `docs/network-setup.md`.
+- Limit the maximum supported vCPUs to 32.
+
+### Changed
+
+- Log the app version when the `Logger` is initialized.
+- Pretty print panic information.
+- Firecracker terminates with exit code 148 when a non-whitelisted syscall
+  is intercepted.
+
+### Fixed
+
+- Fixed build with the `vsock` feature.
+
+## [0.13.0]
+
+### Added
+
+- Documentation for Logger API Requests in `docs/api_requests/logger.md`.
+- Documentation for Actions API Requests in `docs/api_requests/actions.md`.
+- Documentation for MMDS in `docs/mmds.md`.
+- Flush metrics on request via a PUT `/actions` with the `action_type`
+  field set to `FlushMetrics`.
+
+### Changed
+
+- Updated the swagger definition of the `Logger` to specify the required fields
+  and provide default values for optional fields.
+- Default `seccomp-level` is `2` (was previously 0).
+- API Resource IDs can only contain alphanumeric characters and underscores.
+
+### Fixed
+
+- Seccomp filters are now applied to all Firecracker threads.
+- Enforce minimum length of 1 character for the jailer ID.
+- Exit with error code when starting the jailer process fails.
+
+### Removed
+
+- Removed `InstanceHalt` from the list of possible actions.
+
 ## [0.12.0]
 
 ### Added
+
 - The `/logger` API has a new field called `options`. This is an array of
   strings that specify additional logging configurations. The only supported
   value is `LogDirtyPages`.
@@ -16,17 +132,18 @@
 ### Changed
 
 - `PUT` requests on `/mmds` always return 204 on success.
-- `PUT` operations on `/network-interfaces` API resources no longer accept 
+- `PUT` operations on `/network-interfaces` API resources no longer accept
   the previously required `state` parameter.
 - The jailer starts with `--seccomp-level=2` (was previously 0) by default.
 - Log messages use `anonymous-instance` as instance id if none is specified.
 
 ### Fixed
+
 - Fixed crash upon instance start on hosts without 1GB huge page support.
-- Fixed "fault_message" inconsistency between Open API specification and code base.
+- Fixed "fault_message" inconsistency between Open API specification and code
+  base.
 - Ensure MMDS compatibility with C5's IMDS implementation.
 - Corrected the swagger specification to ensure `OpenAPI 2.0` compatibility.
-
 
 ## [0.11.0]
 
@@ -44,7 +161,7 @@
 
 ### Changed
 
-- Improved MMDS network stack performance
+- Improved MMDS network stack performance.
 - If the logging system is not yet initialized (via `PUT /logger`), log events
   are now sent to stdout/stderr.
 - Moved the `instance_info_fails` metric under `get_api_requests`
@@ -52,6 +169,7 @@
   now featured in subject-specific docs.
 
 ### Fixed
+
 - Fixed bug in the MMDS network stack, that caused some RST packets to be sent
   without a destination.
 - Fixed bug in `PATCH /drives`, whereby the ID in the path was not checked

@@ -1,10 +1,10 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(target_arch = "x86_64")]
 extern crate backtrace;
 #[macro_use(crate_version, crate_authors)]
 extern crate clap;
-extern crate serde_json;
 
 extern crate api_server;
 extern crate fc_util;
@@ -12,19 +12,22 @@ extern crate jailer;
 #[macro_use]
 extern crate logger;
 extern crate mmds;
+extern crate seccomp;
 extern crate vmm;
 
+#[cfg(target_arch = "x86_64")]
 use backtrace::Backtrace;
 use clap::{App, Arg};
 
 use std::io::ErrorKind;
 use std::panic;
 use std::path::PathBuf;
+use std::process;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, RwLock};
 
-use api_server::{ApiServer, Error, UnixDomainSocket};
-use jailer::FirecrackerContext;
+use api_server::{ApiServer, Error};
+use fc_util::validators::validate_instance_id;
 use logger::{Metric, LOGGER, METRICS};
 use mmds::MMDS;
 use vmm::vmm_config::instance_info::{InstanceInfo, InstanceState};
@@ -34,11 +37,14 @@ const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 
 fn main() {
     LOGGER
-        .init(DEFAULT_INSTANCE_ID, None, None, vec![])
+        .preinit(Some(DEFAULT_INSTANCE_ID.to_string()))
         .expect("Failed to register logger");
 
-    // If the signal handler can't be set, it's OK to panic.
-    vmm::setup_sigsys_handler().expect("Failed to register signal handler");
+    if let Err(e) = vmm::setup_sigsys_handler() {
+        error!("Failed to register signal handler: {}", e);
+        process::exit(i32::from(vmm::FC_EXIT_CODE_GENERIC_ERROR));
+    }
+
     // Start firecracker by setting up a panic hook, which will be called before
     // terminating as we're building with panic = "abort".
     // It's worth noting that the abort is caused by sending a SIG_ABORT signal to the process.
@@ -46,11 +52,13 @@ fn main() {
         // We're currently using the closure parameter, which is a &PanicInfo, for printing the
         // origin of the panic, including the payload passed to panic! and the source code location
         // from which the panic originated.
-        error!("Panic occurred: {:?}", info);
+        error!("Firecracker {}", info);
         METRICS.vmm.panic_count.inc();
-
-        let bt = Backtrace::new();
-        error!("{:?}", bt);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let bt = Backtrace::new();
+            error!("{:?}", bt);
+        }
 
         // Log the metrics before aborting.
         if let Err(e) = LOGGER.log_metrics() {
@@ -70,37 +78,80 @@ fn main() {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("context")
-                .long("context")
-                .help("Additional parameters sent to Firecracker.")
-                .takes_value(true),
+            Arg::with_name("id")
+                .long("id")
+                .help("MicroVM unique identifier")
+                .default_value(DEFAULT_API_SOCK_PATH)
+                .takes_value(true)
+                .default_value(DEFAULT_INSTANCE_ID)
+                .validator(|s: String| -> Result<(), String> {
+                    validate_instance_id(&s).map_err(|e| format!("{}", e))
+                }),
+        )
+        .arg(
+            Arg::with_name("seccomp-level")
+                .long("seccomp-level")
+                .help(
+                    "Level of seccomp filtering.\n
+                            - Level 0: No filtering.\n
+                            - Level 1: Seccomp filtering by syscall number.\n
+                            - Level 2: Seccomp filtering by syscall number and argument values.\n
+                        ",
+                )
+                .takes_value(true)
+                .default_value("2")
+                .possible_values(&["0", "1", "2"]),
+        )
+        .arg(
+            Arg::with_name("start-time-us")
+                .long("start-time-us")
+                .takes_value(true)
+                .hidden(true),
+        )
+        .arg(
+            Arg::with_name("start-time-cpu-us")
+                .long("start-time-cpu-us")
+                .takes_value(true)
+                .hidden(true),
         )
         .get_matches();
 
     let bind_path = cmd_arguments
         .value_of("api_sock")
-        .map(|s| PathBuf::from(s))
+        .map(PathBuf::from)
         .expect("Missing argument: api_sock");
 
-    let mut instance_id = String::from(DEFAULT_INSTANCE_ID);
-    let mut seccomp_level = 0;
-    let mut start_time_us = None;
-    let mut start_time_cpu_us = None;
-    let mut is_jailed = false;
+    // It's safe to unwrap here because clap's been provided with a default value
+    let instance_id = cmd_arguments.value_of("id").unwrap().to_string();
 
-    if let Some(s) = cmd_arguments.value_of("context") {
-        let context =
-            serde_json::from_str::<FirecrackerContext>(s).expect("Invalid context format");
-        is_jailed = context.jailed;
-        instance_id = context.id;
-        seccomp_level = context.seccomp_level;
-        start_time_us = Some(context.start_time_us);
-        start_time_cpu_us = Some(context.start_time_cpu_us);
-    }
+    // We disable seccomp filtering when testing, because when running the test_gnutests
+    // integration test from test_unittests.py, an invalid syscall is issued, and we crash
+    // otherwise.
+    #[cfg(test)]
+    let seccomp_level = seccomp::SECCOMP_LEVEL_NONE;
+    #[cfg(not(test))]
+    // It's safe to unwrap here because clap's been provided with a default value,
+    // and allowed values are guaranteed to parse to u32.
+    let seccomp_level = cmd_arguments
+        .value_of("seccomp-level")
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+
+    let start_time_us = cmd_arguments.value_of("start-time-us").map(|s| {
+        s.parse::<u64>()
+            .expect("'start-time-us' parameter expected to be of 'u64' type.")
+    });
+
+    let start_time_cpu_us = cmd_arguments.value_of("start-time-cpu-us").map(|s| {
+        s.parse::<u64>()
+            .expect("'start-time-cpu_us' parameter expected to be of 'u64' type.")
+    });
 
     let shared_info = Arc::new(RwLock::new(InstanceInfo {
         state: InstanceState::Uninitialized,
         id: instance_id,
+        vmm_version: crate_version!().to_string(),
     }));
     let mmds_info = MMDS.clone();
     let (to_vmm, from_api) = channel();
@@ -111,37 +162,21 @@ fn main() {
         .get_event_fd_clone()
         .expect("Cannot clone API eventFD.");
 
-    let kvm_fd = if is_jailed {
-        Some(jailer::KVM_FD)
-    } else {
-        None
-    };
-
     let _vmm_thread_handle =
-        vmm::start_vmm_thread(shared_info, api_event_fd, from_api, seccomp_level, kvm_fd);
+        vmm::start_vmm_thread(shared_info, api_event_fd, from_api, seccomp_level);
 
-    let uds_path_or_fd = if is_jailed {
-        UnixDomainSocket::Fd(jailer::LISTENER_FD)
-    } else {
-        UnixDomainSocket::Path(bind_path)
-    };
-
-    match server.bind_and_run(uds_path_or_fd, start_time_us, start_time_cpu_us) {
+    match server.bind_and_run(bind_path, start_time_us, start_time_cpu_us, seccomp_level) {
         Ok(_) => (),
         Err(Error::Io(inner)) => match inner.kind() {
-            ErrorKind::AddrInUse => panic!(
-                "Failed to open the API socket: IO Error: {:?}",
-                Error::Io(inner)
-            ),
+            ErrorKind::AddrInUse => panic!("Failed to open the API socket: {:?}", Error::Io(inner)),
             _ => panic!(
-                "Failed to communicate with the API socket: IO Error: {:?}",
+                "Failed to communicate with the API socket: {:?}",
                 Error::Io(inner)
             ),
         },
-        Err(Error::Eventfd(inner)) => panic!(
-            "Failed to open the API socket: EventFd Error: {:?}",
-            Error::Eventfd(inner)
-        ),
+        Err(eventfd_err @ Error::Eventfd(_)) => {
+            panic!("Failed to open the API socket: {:?}", eventfd_err)
+        }
     }
 }
 
@@ -152,6 +187,7 @@ mod tests {
     use self::tempfile::NamedTempFile;
     use super::*;
 
+    use logger::AppInfo;
     use std::fs::File;
     use std::io::BufRead;
     use std::io::BufReader;
@@ -166,10 +202,9 @@ mod tests {
     fn validate_backtrace(
         log_path: &str,
         expectations: &[(&'static str, &'static str, &'static str)],
-    ) {
+    ) -> bool {
         let f = File::open(log_path).unwrap();
         let reader = BufReader::new(f);
-        let mut pass = false;
         let mut expectation_iter = expectations.iter();
         let mut expected_words = expectation_iter.next().unwrap();
 
@@ -185,13 +220,13 @@ mod tests {
                 expected_words = w;
                 continue;
             }
-            pass = true;
-            break;
+            return true;
         }
-        assert!(pass);
+        false
     }
 
     #[test]
+    #[allow(clippy::unit_cmp)]
     fn test_main() {
         const FIRECRACKER_INIT_TIMEOUT_MILLIS: u64 = 100;
 
@@ -219,10 +254,11 @@ mod tests {
         // Initialize the logger
         LOGGER
             .init(
+                &AppInfo::new("Firecracker", "1.0"),
                 "TEST-ID",
-                Some(log_file_temp.path().to_str().unwrap().to_string()),
-                Some(metrics_file_temp.path().to_str().unwrap().to_string()),
-                vec![],
+                log_file_temp.path().to_str().unwrap().to_string(),
+                metrics_file_temp.path().to_str().unwrap().to_string(),
+                &[],
             )
             .expect("Could not initialize logger.");
 
@@ -231,16 +267,17 @@ mod tests {
         let _ = panic::catch_unwind(|| {
             panic!("Oh, noes!");
         });
-
         // Look for the expected backtrace inside the log
-        validate_backtrace(
-            log_file.as_str(),
-            &[
-                // Lines containing these words should have appeared in the log, in this order
-                ("ERROR", "main.rs", "Panic occurred"),
-                ("ERROR", "main.rs", "stack backtrace:"),
-                ("0:", "0x", "backtrace::"),
-            ],
+        assert!(
+            validate_backtrace(
+                log_file.as_str(),
+                &[
+                    // Lines containing these words should have appeared in the log, in this order
+                    ("ERROR", "main.rs", "Firecracker panicked at"),
+                    ("ERROR", "main.rs", "stack backtrace:"),
+                    ("0:", "0x", "firecracker::main::"),
+                ],
+            ) || println!("Could not validate backtrace!\n {:?}", Backtrace::new()) != ()
         );
 
         // Clean up

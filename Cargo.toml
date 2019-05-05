@@ -1,22 +1,22 @@
 [package]
 name = "firecracker"
-version = "0.12.0"
-authors = ["Amazon firecracker team <firecracker-devel@amazon.com>"]
+version = "0.16.0"
+authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 
 [dependencies]
-# Hardcoding `backtrace`'s version to work around unit test failure triggered by `autocfg` newly introduced dependency.
-# Opened https://github.com/alexcrichton/backtrace-rs/issues/146.
-backtrace = {version = "=0.3.9", features = ["libunwind", "libbacktrace"], default-features = false}
 chrono = ">=0.4"
 clap = "=2.27.1"
-serde_json = ">=1.0.9"
 
 api_server = { path = "api_server" }
-jailer = { path = "jailer" }
-logger = { path = "logger"}
-mmds = { path = "mmds" }
-vmm = { path = "vmm" }
 fc_util = { path = "fc_util" }
+jailer = { path = "jailer" }
+logger = { path = "logger" }
+mmds = { path = "mmds" }
+seccomp = { path = "seccomp" }
+vmm = { path = "vmm" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+backtrace = {version = "0.3", features = ["libunwind", "libbacktrace"], default-features = false}
 
 [dev-dependencies]
 tempfile = ">=3.0.2"
@@ -29,6 +29,6 @@ lto = true
 panic = "abort"
 
 [features]
-vsock = ["api_server/vsock"]
+vsock = ["api_server/vsock", "jailer/vsock"]
 
 [workspace]

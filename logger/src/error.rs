@@ -12,10 +12,12 @@ use std::fmt;
 pub enum LoggerError {
     /// First attempt at initialization failed.
     NeverInitialized(String),
+    /// The logger is locked while preinitializing.
+    IsPreinitializing,
+    /// The logger is locked while initializing
+    IsInitializing,
     /// The logger does not allow reinitialization.
     AlreadyInitialized,
-    /// Attempt to initialize with one pipe and one standard output stream as destinations.
-    DifferentDestinations,
     /// Invalid logger option specified.
     InvalidLogOption(String),
     /// Opening named pipe fails.
@@ -35,14 +37,18 @@ pub enum LoggerError {
 impl fmt::Display for LoggerError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let printable = match *self {
-            LoggerError::NeverInitialized(ref e) => format!("{}", e),
-            LoggerError::AlreadyInitialized => {
-                format!("{}", "Reinitialization of logger not allowed.")
+            LoggerError::NeverInitialized(ref e) => e.to_string(),
+            LoggerError::IsPreinitializing => {
+                "The logger is preinitializing. Can't perform the requested action right now."
+                    .to_string()
             }
-            LoggerError::DifferentDestinations => format!(
-                "{}",
-                "Initialization with one pipe and one standard output stream not allowed."
-            ),
+            LoggerError::IsInitializing => {
+                "The logger is initializing. Can't perform the requested action right now."
+                    .to_string()
+            }
+            LoggerError::AlreadyInitialized => {
+                "Reinitialization of logger not allowed.".to_string()
+            }
             LoggerError::InvalidLogOption(ref s) => format!("Invalid log option: {}", s),
             LoggerError::OpenFIFO(ref e) => {
                 format!("Failed to open pipe. Error: {}", e.description())
@@ -53,9 +59,9 @@ impl fmt::Display for LoggerError {
             LoggerError::LogFlush(ref e) => {
                 format!("Failed to flush logs. Error: {}", e.description())
             }
-            LoggerError::MutexLockFailure(ref e) => format!("{}", e),
-            LoggerError::LogMetricFailure(ref e) => format!("{}", e),
-            LoggerError::LogMetricRateLimit => format!("{}", "Metric will not yet be logged."),
+            LoggerError::MutexLockFailure(ref e) => e.to_string(),
+            LoggerError::LogMetricFailure(ref e) => e.to_string(),
+            LoggerError::LogMetricRateLimit => "Metric will not yet be logged.".to_string(),
         };
         write!(f, "{}", printable)
     }
@@ -88,12 +94,13 @@ mod tests {
         );
 
         assert_eq!(
-            format!("{:?}", LoggerError::DifferentDestinations),
-            "DifferentDestinations"
+            format!("{}", LoggerError::IsPreinitializing),
+            "The logger is preinitializing. Can't perform the requested action right now."
         );
+
         assert_eq!(
-            format!("{}", LoggerError::DifferentDestinations),
-            "Initialization with one pipe and one standard output stream not allowed."
+            format!("{}", LoggerError::IsInitializing),
+            "The logger is initializing. Can't perform the requested action right now."
         );
 
         assert!(format!(

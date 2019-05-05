@@ -1,4 +1,4 @@
-![Firecracker Logo Title](docs/images/fc-logo-title.png)
+![Firecracker Logo Title](docs/images/fc_logo_full_white-bg.png)
 
 Our mission is to enable secure, multi-tenant, minimal-overhead execution of
 container and function workloads.
@@ -33,8 +33,11 @@ To read more about Firecracker, check out
 
 ## Getting Started
 
+To get started with Firecracker, download the latest
+[release](https://github.com/firecracker-microvm/firecracker/releases) binaries or build it from source.
+
 You can build Firecracker on any system that has Docker running (we use a
-development container). The simple steps to get & build Firecracker are:
+development container) as follows:
 
 ```bash
 git clone https://github.com/firecracker-microvm/firecracker
@@ -77,7 +80,8 @@ Firecracker's overall architecture is described in
 
 Firecracker consists of a single micro Virtual Machine Manager process that
 exposes an API endpoint to the host once started. The API is
-[specified in OpenAPI format](api_server/swagger/firecracker.yaml).
+[specified in OpenAPI format](api_server/swagger/firecracker.yaml). Read more
+about it in the [API docs](docs/api_requests).
 
 The **API endpoint** can be used to:
 

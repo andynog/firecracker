@@ -1,12 +1,14 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use common::{VENDOR_ID_AMD, VENDOR_ID_INTEL};
 use std::arch::x86_64::__cpuid as host_cpuid;
 use std::slice;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Error {
     NotSupported,
+    Overflow(String),
 }
 
 /// Register designations used to get/set specific register values within the brand string buffer.
@@ -17,11 +19,15 @@ pub enum Reg {
     EDX = 3,
 }
 
+const BRAND_STRING_INTEL: &[u8] = b"Intel(R) Xeon(R) Processor";
+const BRAND_STRING_AMD: &[u8] = b"AMD EPYC";
+
 /// A CPUID brand string wrapper, providing some efficient manipulation primitives.
 ///
 /// This is achieved by bypassing the `O(n)` indexing, heap allocation, and the unicode checks
 /// done by `std::string::String`.
 ///
+#[derive(Clone)]
 pub struct BrandString {
     /// Flattened buffer, holding an array of 32-bit register values.
     ///
@@ -64,18 +70,49 @@ impl BrandString {
         }
     }
 
+    /// Generates the emulated brand string.
+    ///
+    /// For Intel CPUs, the brand string we expose will be:
+    ///    "Intel(R) Xeon(R) Processor @ {host freq}"
+    /// where {host freq} is the CPU frequency, as present in the
+    /// host brand string (e.g. 4.01GHz).
+    ///
+    /// For AMD CPUs, the brand string we expose will be AMD EPYC.
+    ///
+    /// For other CPUs, we'll just expose an empty string.
+    ///
+    /// This is safe because we know BRAND_STRING_INTEL and BRAND_STRING_AMD to hold valid data
+    /// (allowed length and holding only valid ASCII chars).
+    pub fn from_vendor_id(vendor_id: &[u8; 12]) -> BrandString {
+        match vendor_id {
+            VENDOR_ID_INTEL => {
+                let mut this = BrandString::from_bytes_unchecked(BRAND_STRING_INTEL);
+                if let Ok(host_bstr) = BrandString::from_host_cpuid() {
+                    if let Some(freq) = host_bstr.find_freq() {
+                        this.push_bytes(b" @ ").unwrap();
+                        this.push_bytes(freq)
+                            .expect("Unexpected frequency information in host CPUID");
+                    }
+                }
+                this
+            }
+            VENDOR_ID_AMD => BrandString::from_bytes_unchecked(BRAND_STRING_AMD),
+            _ => BrandString::from_bytes_unchecked(b""),
+        }
+    }
+
     /// Creates a brand string, initialized from the CPUID leaves 0x80000002 through 0x80000004
     /// of the host CPU.
     pub fn from_host_cpuid() -> Result<Self, Error> {
         let mut this = Self::new();
-        let mut cpuid_regs = unsafe { host_cpuid(0x80000000) };
+        let mut cpuid_regs = unsafe { host_cpuid(0x8000_0000) };
 
-        if cpuid_regs.eax < 0x80000004 {
+        if cpuid_regs.eax < 0x8000_0004 {
             // Brand string not supported by the host CPU
             return Err(Error::NotSupported);
         }
 
-        for leaf in 0x80000002..=0x80000004 {
+        for leaf in 0x8000_0002..=0x8000_0004 {
             cpuid_regs = unsafe { host_cpuid(leaf) };
             this.set_reg_for_leaf(leaf, Reg::EAX, cpuid_regs.eax);
             this.set_reg_for_leaf(leaf, Reg::EBX, cpuid_regs.ebx);
@@ -115,7 +152,7 @@ impl BrandString {
         // It's ok not to validate parameters here, leaf and reg should
         // both be compile-time constants. If there's something wrong with them,
         // that's a programming error and we should panic anyway.
-        self.reg_buf[(leaf - 0x80000002) as usize * 4 + reg as usize]
+        self.reg_buf[(leaf - 0x8000_0002) as usize * 4 + reg as usize]
     }
 
     /// Sets the value for the given leaf/register pair.
@@ -126,7 +163,7 @@ impl BrandString {
         // It's ok not to validate parameters here, leaf and reg should
         // both be compile-time constants. If there's something wrong with them,
         // that's a programming error and we should panic anyway.
-        self.reg_buf[(leaf - 0x80000002) as usize * 4 + reg as usize] = val;
+        self.reg_buf[(leaf - 0x8000_0002) as usize * 4 + reg as usize] = val;
     }
 
     /// Gets an immutable `u8` slice view into the brand string buffer.
@@ -148,28 +185,22 @@ impl BrandString {
 
     /// Asserts whether or not there is enough room to append `src` to the brand string.
     fn check_push(&mut self, src: &[u8]) -> bool {
-        !(src.len() > Self::MAX_LEN - self.len)
+        src.len() <= Self::MAX_LEN - self.len
     }
 
     /// Appends `src` to the brand string if there is enough room to append it.
-    pub fn push_bytes(&mut self, src: &[u8]) {
+    pub fn push_bytes(&mut self, src: &[u8]) -> Result<(), Error> {
         if !self.check_push(src) {
             // No room to push all of src.
-            error!("Appending to the brand string failed.");
-            return;
+            return Err(Error::Overflow(
+                "Appending to the brand string failed.".to_string(),
+            ));
         }
         let start = self.len;
         let count = src.len();
         self.len += count;
         self.as_bytes_mut()[start..(start + count)].copy_from_slice(src);
-    }
-
-    /// Checks if `src` is a prefix of the brand string.
-    pub fn starts_with(&self, src: &[u8]) -> bool {
-        if src.len() > Self::MAX_LEN {
-            return false;
-        }
-        &self.as_bytes()[..src.len()] == src
+        Ok(())
     }
 
     /// Searches the brand string for the CPU frequency data it may contain (e.g. 4.01GHz),
@@ -229,14 +260,15 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn test_brand_string() {
         #[inline]
         fn pack_u32(src: &[u8]) -> u32 {
             assert!(src.len() >= 4);
-            src[0] as u32
-                | ((src[1] as u32) << 8)
-                | ((src[2] as u32) << 16)
-                | ((src[3] as u32) << 24)
+            u32::from(src[0])
+                | (u32::from(src[1]) << 8)
+                | (u32::from(src[2]) << 16)
+                | (u32::from(src[3]) << 24)
         }
 
         const TEST_STR: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -246,24 +278,24 @@ mod tests {
         //
         {
             for i in 0_usize..=1_usize {
-                let eax_offs = (4 * 4) * i + 0;
+                let eax_offs = (4 * 4) * i;
                 let ebx_offs = (4 * 4) * i + 4;
                 let ecx_offs = (4 * 4) * i + 8;
                 let edx_offs = (4 * 4) * i + 12;
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x80000002 + i as u32, Reg::EAX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::EAX),
                     pack_u32(&TEST_STR[eax_offs..(eax_offs + 4)])
                 );
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x80000002 + i as u32, Reg::EBX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::EBX),
                     pack_u32(&TEST_STR[ebx_offs..(ebx_offs + 4)])
                 );
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x80000002 + i as u32, Reg::ECX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::ECX),
                     pack_u32(&TEST_STR[ecx_offs..(ecx_offs + 4)])
                 );
                 assert_eq!(
-                    bstr.get_reg_for_leaf(0x80000002 + i as u32, Reg::EDX),
+                    bstr.get_reg_for_leaf(0x8000_0002 + i as u32, Reg::EDX),
                     pack_u32(&TEST_STR[edx_offs..(edx_offs + 4)])
                 );
             }
@@ -275,27 +307,19 @@ mod tests {
 
         // Test mutable bitwise casting and finding the frequency substring
         //
-        bstr.set_reg_for_leaf(0x80000003, Reg::EBX, pack_u32(b"5.20"));
-        bstr.set_reg_for_leaf(0x80000003, Reg::ECX, pack_u32(b"GHz "));
+        bstr.set_reg_for_leaf(0x8000_0003, Reg::EBX, pack_u32(b"5.20"));
+        bstr.set_reg_for_leaf(0x8000_0003, Reg::ECX, pack_u32(b"GHz "));
         assert_eq!(bstr.find_freq().unwrap(), b"5.20GHz");
 
         let _overflow: [u8; 50] = [b'a'; 50];
-
-        // Test BrandString::starts_with()
-        //
-        assert_eq!(bstr.starts_with(b"012345"), true);
-        assert_eq!(bstr.starts_with(b"01234X"), false);
-        assert_eq!(bstr.starts_with(b"X01234"), false);
-        assert_eq!(bstr.starts_with(&_overflow), false);
 
         // Test BrandString::check_push()
         //
         bstr = BrandString::new();
         assert!(bstr.check_push(b"Hello"));
-        bstr.push_bytes(b"Hello");
+        bstr.push_bytes(b"Hello").unwrap();
         assert!(bstr.check_push(b", world!"));
-        bstr.push_bytes(b", world!");
-        assert!(bstr.starts_with(b"Hello, world!"));
+        bstr.push_bytes(b", world!").unwrap();
 
         assert!(!bstr.check_push(&_overflow));
 
@@ -304,14 +328,19 @@ mod tests {
         let actual_len = bstr.as_bytes().len();
         let mut old_bytes: Vec<u8> = repeat(0).take(actual_len).collect();
         old_bytes.copy_from_slice(bstr.as_bytes());
-        bstr.push_bytes(&_overflow);
+        assert_eq!(
+            bstr.push_bytes(&_overflow),
+            Err(Error::Overflow(
+                "Appending to the brand string failed.".to_string()
+            ))
+        );
         assert!(bstr.as_bytes().to_vec() == old_bytes);
 
         // Test BrandString::from_host_cpuid() and get_reg_for_leaf()
         //
         match BrandString::from_host_cpuid() {
             Ok(bstr) => {
-                for leaf in 0x80000002..=0x80000004_u32 {
+                for leaf in 0x8000_0002..=0x8000_0004_u32 {
                     let host_regs = unsafe { host_cpuid(leaf) };
                     assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::EAX), host_regs.eax);
                     assert_eq!(bstr.get_reg_for_leaf(leaf, Reg::EBX), host_regs.ebx);
@@ -322,10 +351,22 @@ mod tests {
             Err(Error::NotSupported) => {
                 // from_host_cpuid() should only fail if the host CPU doesn't support
                 // CPUID leaves up to 0x80000004, so let's make sure that's what happened.
-                let host_regs = unsafe { host_cpuid(0x80000000) };
-                assert!(host_regs.eax < 0x80000004);
+                let host_regs = unsafe { host_cpuid(0x8000_0000) };
+                assert!(host_regs.eax < 0x8000_0004);
             }
+            _ => assert!(
+                false,
+                "This function should not return another type of error"
+            ),
         }
+
+        // Test BrandString::from_vendor_id()
+        let bstr = BrandString::from_vendor_id(VENDOR_ID_INTEL);
+        assert!(bstr.as_bytes().starts_with(BRAND_STRING_INTEL));
+        let bstr = BrandString::from_vendor_id(VENDOR_ID_AMD);
+        assert!(bstr.as_bytes().starts_with(BRAND_STRING_AMD));
+        let bstr = BrandString::from_vendor_id(b"............");
+        assert!(bstr.as_bytes() == vec![b'\0'; 48].as_slice());
     }
 
     #[test]

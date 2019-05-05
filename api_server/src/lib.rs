@@ -21,12 +21,11 @@ extern crate vmm;
 mod http_service;
 pub mod request;
 
-use std::io;
-use std::os::unix::io::FromRawFd;
-use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
+use std::{fmt, io};
 
 use futures::{Future, Stream};
 use hyper::server::Http;
@@ -37,18 +36,31 @@ use http_service::ApiServerHttpService;
 use logger::{Metric, METRICS};
 use mmds::data_store::Mmds;
 use sys_util::EventFd;
+use vmm::default_syscalls;
 use vmm::vmm_config::instance_info::InstanceInfo;
 use vmm::VmmAction;
 
-#[derive(Debug)]
 pub enum Error {
     Io(io::Error),
-    Eventfd(sys_util::Error),
+    Eventfd(io::Error),
 }
 
-pub enum UnixDomainSocket<P> {
-    Path(P),
-    Fd(i32),
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Error::Io(ref err) => write!(f, "IO error: {}", err),
+            Error::Eventfd(ref err) => write!(f, "EventFd error: {}", err),
+        }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Error::Io(ref err) => write!(f, "IO error: {}", err),
+            Error::Eventfd(ref err) => write!(f, "EventFd error: {}", err),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -78,27 +90,17 @@ impl ApiServer {
     }
 
     // TODO: does tokio_uds also support abstract domain sockets?
-    pub fn bind_and_run<P: AsRef<Path>>(
+    pub fn bind_and_run(
         &self,
-        path_or_fd: UnixDomainSocket<P>,
+        path: PathBuf,
         start_time_us: Option<u64>,
         start_time_cpu_us: Option<u64>,
+        seccomp_level: u32,
     ) -> Result<()> {
         let mut core = Core::new().map_err(Error::Io)?;
         let handle = Rc::new(core.handle());
 
-        let listener = match path_or_fd {
-            UnixDomainSocket::Path(path) => UnixListener::bind(path, &handle).map_err(Error::Io)?,
-            UnixDomainSocket::Fd(fd) => {
-                // Safe because we assume fd is a valid file descriptor number, associated with a
-                // previously bound UnixListener.
-                UnixListener::from_listener(
-                    unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) },
-                    &handle,
-                )
-                .map_err(Error::Io)?
-            }
-        };
+        let listener = UnixListener::bind(path, &handle).map_err(Error::Io)?;
 
         if let Some(start_time) = start_time_us {
             let delta_us = (chrono::Utc::now().timestamp_nanos() / 1000) as u64 - start_time;
@@ -137,6 +139,16 @@ impl ApiServer {
             })
             .map_err(Error::Io);
 
+        // Load seccomp filters on the API thread.
+        // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
+        // altogether is the desired behaviour.
+        if let Err(e) = default_syscalls::set_seccomp_level(seccomp_level) {
+            panic!(
+                "Failed to set the requested seccomp filters on the API thread: Error: {:?}",
+                e
+            );
+        }
+
         // This runs forever, unless an error is returned somewhere within f (but nothing happens
         // for errors which might arise inside the connections we spawn from f, unless we explicitly
         // do something in their future chain). When this returns, ongoing connections will be
@@ -146,5 +158,38 @@ impl ApiServer {
 
     pub fn get_event_fd_clone(&self) -> Result<EventFd> {
         self.efd.try_clone().map_err(Error::Eventfd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_messages() {
+        let e = Error::Io(io::Error::from_raw_os_error(0));
+        assert_eq!(
+            format!("{}", e),
+            format!("IO error: {}", io::Error::from_raw_os_error(0))
+        );
+        let e = Error::Eventfd(io::Error::from_raw_os_error(0));
+        assert_eq!(
+            format!("{}", e),
+            format!("EventFd error: {}", io::Error::from_raw_os_error(0))
+        );
+    }
+
+    #[test]
+    fn test_error_debug() {
+        let e = Error::Io(io::Error::from_raw_os_error(0));
+        assert_eq!(
+            format!("{:?}", e),
+            format!("IO error: {}", io::Error::from_raw_os_error(0))
+        );
+        let e = Error::Eventfd(io::Error::from_raw_os_error(0));
+        assert_eq!(
+            format!("{:?}", e),
+            format!("EventFd error: {}", io::Error::from_raw_os_error(0))
+        );
     }
 }

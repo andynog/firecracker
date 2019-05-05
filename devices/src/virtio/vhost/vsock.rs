@@ -13,9 +13,6 @@ use memory_model::GuestMemory;
 use sys_util::EventFd;
 use vhost_backend::Vhost;
 use vhost_backend::Vsock as VhostVsockFd;
-use vhost_gen::vhost::*;
-use virtio_gen::virtio_config::*;
-use virtio_gen::virtio_ring::*;
 
 use byteorder::{ByteOrder, LittleEndian};
 use epoll;
@@ -24,7 +21,7 @@ use std::sync::Arc;
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 3;
-const QUEUE_SIZES: &'static [u16] = &[QUEUE_SIZE; NUM_QUEUES];
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
 impl std::convert::From<super::Error> for ActivateError {
     fn from(error: super::Error) -> Self {
@@ -46,13 +43,7 @@ impl Vsock {
     /// Create a new virtio-vsock device with the given VM cid.
     pub fn new(cid: u64, mem: &GuestMemory, epoll_config: VhostEpollConfig) -> Result<Vsock> {
         let fd = VhostVsockFd::new(mem).map_err(Error::VhostOpen)?;
-
-        let avail_features = 1 << VIRTIO_F_NOTIFY_ON_EMPTY
-            | 1 << VIRTIO_RING_F_INDIRECT_DESC
-            | 1 << VIRTIO_RING_F_EVENT_IDX
-            | 1 << VHOST_F_LOG_ALL
-            | 1 << VIRTIO_F_ANY_LAYOUT
-            | 1 << VIRTIO_F_VERSION_1;
+        let avail_features = fd.get_features().map_err(Error::VhostGetFeatures)?;
 
         Ok(Vsock {
             vsock_fd: Some(fd),
@@ -93,8 +84,8 @@ impl VirtioDevice for Vsock {
 
     fn ack_features(&mut self, page: u32, value: u32) {
         let mut v = match page {
-            0 => value as u64,
-            1 => (value as u64) << 32,
+            0 => u64::from(value),
+            1 => u64::from(value) << 32,
             _ => {
                 warn!(
                     "vsock: virtio-vsock device cannot ack unknown feature page: {}",
@@ -118,9 +109,9 @@ impl VirtioDevice for Vsock {
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         match offset {
             0 if data.len() == 8 => LittleEndian::write_u64(data, self.cid),
-            0 if data.len() == 4 => LittleEndian::write_u32(data, (self.cid & 0xffffffff) as u32),
+            0 if data.len() == 4 => LittleEndian::write_u32(data, (self.cid & 0xffff_ffff) as u32),
             4 if data.len() == 4 => {
-                LittleEndian::write_u32(data, ((self.cid >> 32) & 0xffffffff) as u32)
+                LittleEndian::write_u32(data, ((self.cid >> 32) & 0xffff_ffff) as u32)
             }
             _ => warn!(
                 "vsock: virtio-vsock received invalid read request of {} bytes at offset {}",
@@ -169,10 +160,8 @@ impl VirtioDevice for Vsock {
                 // Preliminary setup for vhost net.
                 vsock_fd.set_owner().map_err(Error::VhostSetOwner)?;
 
-                let avail_features = vsock_fd.get_features().map_err(Error::VhostGetFeatures)?;
-                let features: u64 = self.acked_features & avail_features;
                 vsock_fd
-                    .set_features(features)
+                    .set_features(self.acked_features)
                     .map_err(Error::VhostSetFeatures)?;
 
                 vsock_fd.set_mem_table().map_err(Error::VhostSetMemTable)?;
@@ -227,9 +216,12 @@ impl VirtioDevice for Vsock {
 
                 epoll::ctl(
                     self.epoll_config.get_raw_epoll_fd(),
-                    epoll::EPOLL_CTL_ADD,
+                    epoll::ControlOptions::EPOLL_CTL_ADD,
                     queue_evt_raw_fd,
-                    epoll::Event::new(epoll::EPOLLIN, self.epoll_config.get_queue_evt_token()),
+                    epoll::Event::new(
+                        epoll::Events::EPOLLIN,
+                        self.epoll_config.get_queue_evt_token(),
+                    ),
                 )
                 .map_err(ActivateError::EpollCtl)?;
 

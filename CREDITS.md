@@ -12,47 +12,74 @@ written in Rust with a focus on safety and security. Thanks go to:
 * [Daniel Verkamp](https://github.com/danielverkamp) <dverkamp@chromium.org>
 * [Stephen Barber](https://github.com/smibarber) <smbarber@chromium.org>
 * [Chirantan Ekbote](https://github.com/jynnantonix) <chirantan@chromium.org>
-* [Jason D. Clinton](https://github.com/jclinton) jclinton@chromium.org
+* [Jason D. Clinton](https://github.com/jclinton) <jclinton@chromium.org>
 * Sonny Rao <sonnyrao@chromium.org>
 
 
 Contributors to the Firecracker repository:
 
+* Aaron Hill <aa1ronham@gmail.com>
 * Adrian Catangiu <acatan@amazon.com>
 * Alakesh <alakeshh@amazon.com>
 * Aleksa Sarai <cyphar@cyphar.com>
 * Alex Chan <a.chan@wellcome.ac.uk>
-* Alexandra Ghecenco <aghecen@amazon.com>
+* Alex Glikson <alex.glikson@gmail.com>
 * Alexandra Iordache <aghecen@amazon.com>
 * Alexandru Agache <aagch@amazon.com>
 * Alexandru Branciog <branciog@amazon.com>
 * Andreea Florescu <fandree@amazon.com>
+* Andrei Cipu <acipu@amazon.com>
 * Arun Gupta <arun.gupta@gmail.com>
+* Atsushi Ishibashi <atsushi.ishibashi@finatext.com>
 * Bogdan Ionita <bci@amazon.com>
+* Chinmay Kousik <chinmaykousik1@gmail.com>
+* Chris Christensen <christianchristensen@gmail.com>
 * Christopher Diehl <diehl.chris24@gmail.com>
+* cneira <cneirabustos@gmail.com>
 * Constantin Musca <mcostin@amazon.com>
 * Dan Horobeanu <dhr@amazon.com>
+* Dan Lemmond <d.j.lemmond@gmail.com>
 * Deepesh Pathak <deepshpathak@gmail.com>
 * Diana Popa <dpopa@amazon.com>
 * Filippo Sironi <sironi@amazon.de>
+* Gabe Jackson <gj@mail.co.de>
 * german gomez <germangb42@gmail.com>
 * Greg Dunn <gregdunn@amazon.com>
 * Henri Yandell <hyandell@users.noreply.github.com>
+* Iggy Jackson <iggy@theiggy.com>
 * James Turnbull <james@lovedthanlost.net>
+* Javier Romero <xavinux@gmail.com>
+* Josh Abraham <sinisterpatrician@gmail.com>
+* Julian Stecklina <js@alien8.de>
+* Liu Jiang <gerry@linux.alibaba.com>
+* Lloyd <lloydmeta@gmail.com>
+* lloydmeta <lloydmeta@gmail.com>
 * maciejhirsz <maciej.hirsz@gmail.com>
+* Marc Brooker <mbrooker@amazon.com>
+* Masatoshi Higuchi <matt9ucci@gmail.com>
 * Massimiliano Torromeo <massimiliano.torromeo@gmail.com>
 * Matt Wilson <msw@amazon.com>
+* Mehrdad Arshad Rad <arshad.rad@gmail.com>
+* Nathan Sizemore <nathanrsizemore@gmail.com>
 * Nicolas Mesa <nicolasmesa@gmail.com>
 * Noah Meyerhans <nmeyerha@amazon.com>
+* Peng Tao <bergwolf@gmail.com>
+* Petre Eftime <epetre@amazon.com>
 * Radu Matei Lăcraru <ral@amazon.com>
 * Radu Weiss <raduweis@amazon.com>
 * Ram Sripracha <ramsri@amazon.com>
+* Rob Devereux <robdevereux92@gmail.com>
+* Robert Grimes <rmzgrimes@gmail.com>
 * Rolf Neugebauer <neugebar@amazon.com>
 * Sam Jackson <sam@clique.app>
+* Sean Lavine <freewil@users.noreply.github.com>
+* Serban Iorga <seriorga@amazon.com>
 * Sripracha <ramsri@amazon.com>
 * Tim Bannister <tim@scalefactory.com>
 * Tim Deegan <tdeegan@amazon.com>
 * Tyler Anton <tyler@debian.anton>
+* Urvil Patel <patelurvil38@gmail.com>
 * Weixiao Huang <hwx.simle@gmail.com>
 * xibz <impactbchang@gmail.com>
+* YLyu <lyuyuan92@gmail.com>
 * Yuval Kohavi <yuval.kohavi@gmail.com>

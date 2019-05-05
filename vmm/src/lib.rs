@@ -8,10 +8,12 @@
 //! Virtual Machine Monitor that leverages the Linux Kernel-based Virtual Machine (KVM),
 //! and other virtualization features to run a single lightweight micro-virtual
 //! machine (microVM).
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 extern crate chrono;
 extern crate epoll;
 extern crate futures;
+extern crate kvm_bindings;
+extern crate kvm_ioctls;
 extern crate libc;
 extern crate serde;
 #[macro_use]
@@ -20,11 +22,12 @@ extern crate serde_json;
 extern crate time;
 extern crate timerfd;
 
+extern crate arch;
+#[cfg(target_arch = "x86_64")]
 extern crate cpuid;
 extern crate devices;
 extern crate fc_util;
 extern crate kernel;
-extern crate kvm;
 #[macro_use]
 extern crate logger;
 extern crate memory_model;
@@ -32,13 +35,12 @@ extern crate net_util;
 extern crate rate_limiter;
 extern crate seccomp;
 extern crate sys_util;
-extern crate x86_64;
 
-mod default_syscalls;
+/// Syscalls allowed through the seccomp filter.
+pub mod default_syscalls;
 mod device_manager;
 /// Signal handling utilities for seccomp violations.
 mod sigsys_handler;
-mod vm_control;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 mod vstate;
@@ -48,95 +50,146 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::fs::{metadata, File, OpenOptions};
+use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use libc::{c_void, siginfo_t};
+use kvm_bindings::KVM_API_VERSION;
+use kvm_ioctls::{Cap, Kvm};
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 
 use device_manager::legacy::LegacyDeviceManager;
 use device_manager::mmio::MMIODeviceManager;
+use devices::legacy::I8042DeviceError;
 use devices::virtio;
 use devices::{DeviceEventT, EpollHandler, EpollHandlerPayload};
 use fc_util::now_cputime_us;
 use kernel::cmdline as kernel_cmdline;
 use kernel::loader as kernel_loader;
-use kvm::*;
-use logger::{Level, LogOption, Metric, LOGGER, METRICS};
+use logger::error::LoggerError;
+use logger::{AppInfo, Level, LogOption, Metric, LOGGER, METRICS};
 use memory_model::{GuestAddress, GuestMemory};
-use seccomp::{
-    setup_seccomp, SeccompLevel, SECCOMP_LEVEL_ADVANCED, SECCOMP_LEVEL_BASIC, SECCOMP_LEVEL_NONE,
-};
+use net_util::TapError;
+#[cfg(target_arch = "aarch64")]
 use serde_json::Value;
 pub use sigsys_handler::setup_sigsys_handler;
-use sys_util::{register_signal_handler, EventFd, Killable, Terminal};
-use vm_control::VmResponse;
+use sys_util::{EventFd, Terminal};
 use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use vmm_config::drive::{BlockDeviceConfig, BlockDeviceConfigs, DriveError};
 use vmm_config::instance_info::{InstanceInfo, InstanceState, StartMicrovmError};
 use vmm_config::logger::{LoggerConfig, LoggerConfigError, LoggerLevel};
 use vmm_config::machine_config::{VmConfig, VmConfigError};
-use vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceConfigs, NetworkInterfaceError};
+use vmm_config::net::{
+    NetworkInterfaceConfig, NetworkInterfaceConfigs, NetworkInterfaceError,
+    NetworkInterfaceUpdateConfig,
+};
 #[cfg(feature = "vsock")]
 use vmm_config::vsock::{VsockDeviceConfig, VsockDeviceConfigs, VsockError};
 use vstate::{Vcpu, Vm};
 
-const MAGIC_IOPORT_SIGNAL_GUEST_BOOT_COMPLETE: u16 = 0x03f0;
-const MAGIC_VALUE_SIGNAL_GUEST_BOOT_COMPLETE: u8 = 123;
-
-const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 pci=off nomodules 8250.nr_uarts=0";
-const VCPU_RTSIG_OFFSET: i32 = 0;
+/// Default guest kernel command line:
+/// - `reboot=k` shut down the guest on reboot, instead of well... rebooting;
+/// - `panic=1` on panic, reboot after 1 second;
+/// - `pci=off` do not scan for PCI devices (save boot time);
+/// - `nomodules` disable loadable kernel module support;
+/// - `8250.nr_uarts=0` disable 8250 serial interface;
+/// - `i8042.noaux` do not probe the i8042 controller for an attached mouse (save boot time);
+/// - `i8042.nomux` do not probe i8042 for a multiplexing controller (save boot time);
+/// - `i8042.nopnp` do not use ACPIPnP to discover KBD/AUX controllers (save boot time);
+/// - `i8042.dumbkbd` do not attempt to control kbd state via the i8042 (save boot time).
+const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 pci=off nomodules 8250.nr_uarts=0 \
+                                      i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd";
 const WRITE_METRICS_PERIOD_SECONDS: u64 = 60;
-static START_INSTANCE_REQUEST_TS: AtomicUsize = ATOMIC_USIZE_INIT;
-static START_INSTANCE_REQUEST_CPU_TS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+/// Success exit code.
+pub const FC_EXIT_CODE_OK: u8 = 0;
+/// Generic error exit code.
+pub const FC_EXIT_CODE_GENERIC_ERROR: u8 = 1;
+/// Generic exit code for an error considered not possible to occur if the program logic is sound.
+pub const FC_EXIT_CODE_UNEXPECTED_ERROR: u8 = 2;
+/// Firecracker was shut down after intercepting a restricted system call.
+pub const FC_EXIT_CODE_BAD_SYSCALL: u8 = 148;
 
 /// Errors associated with the VMM internal logic. These errors cannot be generated by direct user
 /// input, but can result from bad configuration of the host (for example if Firecracker doesn't
 /// have permissions to open the KVM fd).
-#[derive(Debug)]
-enum Error {
+pub enum Error {
     /// Cannot receive message from the API.
     ApiChannel,
     /// Legacy devices work with Event file descriptors and the creation can fail because
     /// of resource exhaustion.
     CreateLegacyDevice(device_manager::legacy::Error),
     /// An operation on the epoll instance failed due to resource exhaustion or bad configuration.
-    EpollFd(std::io::Error),
+    EpollFd(io::Error),
     /// Cannot read from an Event file descriptor.
-    EventFd(sys_util::Error),
-    /// Describes a logical problem.
-    GeneralFailure, // TODO: there are some cases in which this error should be replaced.
+    EventFd(io::Error),
+    /// An event arrived for a device, but the dispatcher can't find the event (epoll) handler.
+    DeviceEventHandlerNotFound,
     /// Cannot open /dev/kvm. Either the host does not have KVM or Firecracker does not have
     /// permission to open the file descriptor.
-    Kvm(sys_util::Error),
+    Kvm(io::Error),
     /// The host kernel reports an invalid KVM API version.
     KvmApiVersion(i32),
     /// Cannot initialize the KVM context due to missing capabilities.
-    KvmCap(kvm::Cap),
+    KvmCap(kvm_ioctls::Cap),
     /// Epoll wait failed.
-    Poll(std::io::Error),
+    Poll(io::Error),
     /// Write to the serial console failed.
-    Serial(sys_util::Error),
+    Serial(io::Error),
     /// Cannot create Timer file descriptor.
-    TimerFd(std::io::Error),
+    TimerFd(io::Error),
     /// Cannot open the VM file descriptor.
     Vm(vstate::Error),
 }
 
+// Implementing Debug as these errors are mostly used in panics & expects.
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        use self::Error::*;
+
+        match self {
+            ApiChannel => write!(f, "ApiChannel: error receiving data from the API server"),
+            CreateLegacyDevice(e) => write!(f, "Error creating legacy device: {:?}", e),
+            EpollFd(e) => write!(f, "Epoll fd error: {}", e.to_string()),
+            EventFd(e) => write!(f, "Event fd error: {}", e.to_string()),
+            DeviceEventHandlerNotFound => write!(
+                f,
+                "Device event handler not found. This might point to a guest device driver issue."
+            ),
+            Kvm(os_err) => write!(f, "Cannot open /dev/kvm. Error: {}", os_err.to_string()),
+            KvmApiVersion(ver) => write!(f, "Bad KVM API version: {}", ver),
+            KvmCap(cap) => write!(f, "Missing KVM capability: {:?}", cap),
+            Poll(e) => write!(f, "Epoll wait failed: {}", e.to_string()),
+            Serial(e) => write!(f, "Error writing to the serial console: {:?}", e),
+            TimerFd(e) => write!(f, "Error creating timer fd: {}", e.to_string()),
+            Vm(e) => write!(f, "Error opening VM fd: {:?}", e),
+        }
+    }
+}
+
 /// Types of errors associated with vmm actions.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ErrorKind {
     /// User Errors describe bad configuration (user input).
     User,
     /// Internal Errors are unrelated to the user and usually refer to logical errors
     /// or bad management of resources (memory, file descriptors & others).
     Internal,
+}
+
+impl PartialEq for ErrorKind {
+    fn eq(&self, other: &ErrorKind) -> bool {
+        match (self, other) {
+            (&ErrorKind::User, &ErrorKind::User) => true,
+            (&ErrorKind::Internal, &ErrorKind::Internal) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -161,15 +214,119 @@ pub enum VmmActionError {
     /// The action `StartMicroVm` failed either because of bad user input (`ErrorKind::User`) or
     /// an internal error (`ErrorKind::Internal`).
     StartMicrovm(ErrorKind, StartMicrovmError),
+    /// The action `SendCtrlAltDel` failed. Details are provided by the device-specific error
+    /// `I8042DeviceError`.
+    SendCtrlAltDel(ErrorKind, I8042DeviceError),
     #[cfg(feature = "vsock")]
     /// The action `insert_vsock_device` failed either because of bad user input (`ErrorKind::User`)
     /// or an internal error (`ErrorKind::Internal`).
     VsockConfig(ErrorKind, VsockError),
 }
 
+// It's convenient to turn DriveErrors into VmmActionErrors directly.
+impl std::convert::From<DriveError> for VmmActionError {
+    fn from(e: DriveError) -> Self {
+        let kind = match e {
+            // User errors.
+            DriveError::CannotOpenBlockDevice
+            | DriveError::InvalidBlockDeviceID
+            | DriveError::InvalidBlockDevicePath
+            | DriveError::BlockDevicePathAlreadyExists
+            | DriveError::BlockDeviceUpdateFailed
+            | DriveError::OperationNotAllowedPreBoot
+            | DriveError::UpdateNotAllowedPostBoot
+            | DriveError::RootBlockDeviceAlreadyAdded => ErrorKind::User,
+        };
+        VmmActionError::DriveConfig(kind, e)
+    }
+}
+
+// It's convenient to turn VmConfigErrors into VmmActionErrors directly.
+impl std::convert::From<VmConfigError> for VmmActionError {
+    fn from(e: VmConfigError) -> Self {
+        VmmActionError::MachineConfig(
+            match e {
+                // User errors.
+                VmConfigError::InvalidVcpuCount
+                | VmConfigError::InvalidMemorySize
+                | VmConfigError::UpdateNotAllowedPostBoot => ErrorKind::User,
+            },
+            e,
+        )
+    }
+}
+
+// It's convenient to turn NetworkInterfaceErrors into VmmActionErrors directly.
+impl std::convert::From<NetworkInterfaceError> for VmmActionError {
+    fn from(e: NetworkInterfaceError) -> Self {
+        let kind = match e {
+            // User errors.
+            NetworkInterfaceError::GuestMacAddressInUse(_)
+            | NetworkInterfaceError::HostDeviceNameInUse(_)
+            | NetworkInterfaceError::DeviceIdNotFound
+            | NetworkInterfaceError::UpdateNotAllowedPostBoot => ErrorKind::User,
+            // Internal errors.
+            NetworkInterfaceError::EpollHandlerNotFound(_)
+            | NetworkInterfaceError::RateLimiterUpdateFailed(_) => ErrorKind::Internal,
+            NetworkInterfaceError::OpenTap(ref te) => match te {
+                // User errors.
+                TapError::OpenTun(_) | TapError::CreateTap(_) | TapError::InvalidIfname => {
+                    ErrorKind::User
+                }
+                // Internal errors.
+                TapError::IoctlError(_) | TapError::NetUtil(_) => ErrorKind::Internal,
+            },
+        };
+        VmmActionError::NetworkConfig(kind, e)
+    }
+}
+
+// It's convenient to turn StartMicrovmErrors into VmmActionErrors directly.
+impl std::convert::From<StartMicrovmError> for VmmActionError {
+    fn from(e: StartMicrovmError) -> Self {
+        let kind = match e {
+            // User errors.
+            #[cfg(feature = "vsock")]
+            StartMicrovmError::CreateVsockDevice(_) => ErrorKind::User,
+            StartMicrovmError::CreateBlockDevice(_)
+            | StartMicrovmError::CreateNetDevice(_)
+            | StartMicrovmError::KernelCmdline(_)
+            | StartMicrovmError::KernelLoader(_)
+            | StartMicrovmError::MicroVMAlreadyRunning
+            | StartMicrovmError::MissingKernelConfig
+            | StartMicrovmError::NetDeviceNotConfigured
+            | StartMicrovmError::OpenBlockDevice(_)
+            | StartMicrovmError::VcpusNotConfigured => ErrorKind::User,
+            // Internal errors.
+            #[cfg(feature = "vsock")]
+            StartMicrovmError::RegisterVsockDevice(_) => ErrorKind::Internal,
+            StartMicrovmError::ConfigureSystem(_)
+            | StartMicrovmError::ConfigureVm(_)
+            | StartMicrovmError::CreateRateLimiter(_)
+            | StartMicrovmError::DeviceManager
+            | StartMicrovmError::EventFd
+            | StartMicrovmError::GuestMemory(_)
+            | StartMicrovmError::LegacyIOBus(_)
+            | StartMicrovmError::RegisterBlockDevice(_)
+            | StartMicrovmError::RegisterEvent
+            | StartMicrovmError::RegisterNetDevice(_)
+            | StartMicrovmError::SeccompFilters(_)
+            | StartMicrovmError::Vcpu(_)
+            | StartMicrovmError::VcpuConfigure(_)
+            | StartMicrovmError::VcpuSpawn(_) => ErrorKind::Internal,
+            // The only user `LoadCommandline` error is `CommandLineOverflow`.
+            StartMicrovmError::LoadCommandline(ref cle) => match cle {
+                kernel_loader::Error::CommandLineOverflow => ErrorKind::User,
+                _ => ErrorKind::Internal,
+            },
+        };
+        VmmActionError::StartMicrovm(kind, e)
+    }
+}
+
 impl VmmActionError {
     /// Returns the error type.
-    pub fn get_kind(&self) -> &ErrorKind {
+    pub fn kind(&self) -> &ErrorKind {
         use self::VmmActionError::*;
 
         match *self {
@@ -179,6 +336,7 @@ impl VmmActionError {
             MachineConfig(ref kind, _) => kind,
             NetworkConfig(ref kind, _) => kind,
             StartMicrovm(ref kind, _) => kind,
+            SendCtrlAltDel(ref kind, _) => kind,
             #[cfg(feature = "vsock")]
             VsockConfig(ref kind, _) => kind,
         }
@@ -196,6 +354,7 @@ impl Display for VmmActionError {
             MachineConfig(_, ref err) => write!(f, "{}", err.to_string()),
             NetworkConfig(_, ref err) => write!(f, "{}", err.to_string()),
             StartMicrovm(_, ref err) => write!(f, "{}", err.to_string()),
+            SendCtrlAltDel(_, ref err) => write!(f, "{}", err.to_string()),
             #[cfg(feature = "vsock")]
             VsockConfig(_, ref err) => write!(f, "{}", err.to_string()),
         }
@@ -204,6 +363,8 @@ impl Display for VmmActionError {
 
 /// This enum represents the public interface of the VMM. Each action contains various
 /// bits of information (ids, paths, etc.), together with an OutcomeSender, which is always present.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum VmmAction {
     /// Configure the boot source of the microVM using as input the `ConfigureBootSource`. This
     /// action can only be called before the microVM has booted. The response is sent using the
@@ -214,6 +375,9 @@ pub enum VmmAction {
     ConfigureLogger(LoggerConfig, OutcomeSender),
     /// Get the configuration of the microVM. The action response is sent using the `OutcomeSender`.
     GetVmConfiguration(OutcomeSender),
+    /// Flush the metrics. This action can only be called after the logger has been configured.
+    /// The response is sent using the `OutcomeSender`.
+    FlushMetrics(OutcomeSender),
     /// Add a new block device or update one that already exists using the `BlockDeviceConfig` as
     /// input. This action can only be called before the microVM has booted. The response
     /// is sent using the `OutcomeSender`.
@@ -238,10 +402,16 @@ pub enum VmmAction {
     /// Launch the microVM. This action can only be called before the microVM has booted.
     /// The response is sent using the `OutcomeSender`.
     StartMicroVm(OutcomeSender),
+    /// Send CTRL+ALT+DEL to the microVM, using the i8042 keyboard function. If an AT-keyboard
+    /// driver is listening on the guest end, this can be used to shut down the microVM gracefully.
+    SendCtrlAltDel(OutcomeSender),
     /// Update the path of an existing block device. The data associated with this variant
     /// represents the `drive_id` and the `path_on_host`. The response is sent using
     /// the `OutcomeSender`.
     UpdateBlockDevicePath(String, String, OutcomeSender),
+    /// Update a network interface, after microVM start. Currently, the only updatable properties
+    /// are the RX and TX rate limiters.
+    UpdateNetworkInterface(NetworkInterfaceUpdateConfig, OutcomeSender),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either
@@ -263,6 +433,21 @@ pub type OutcomeReceiver = oneshot::Receiver<VmmRequestOutcome>;
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Holds a micro-second resolution timestamp with both the real time and cpu time.
+#[derive(Clone, Default)]
+pub struct TimestampUs {
+    /// Real time in microseconds.
+    pub time_us: u64,
+    /// Cpu time in microseconds.
+    pub cputime_us: u64,
+}
+
+#[inline]
+/// Gets the wallclock timestamp as microseconds.
+fn get_time_us() -> u64 {
+    (chrono::Utc::now().timestamp_nanos() / 1000) as u64
+}
+
 /// Describes a KVM context that gets attached to the micro vm instance.
 /// It gives access to the functionality of the KVM wrapper as long as every required
 /// KVM capability is present on the host.
@@ -272,7 +457,7 @@ pub struct KvmContext {
 }
 
 impl KvmContext {
-    fn new(kvm_fd: Option<RawFd>) -> Result<Self> {
+    fn new() -> Result<Self> {
         fn check_cap(kvm: &Kvm, cap: Cap) -> std::result::Result<(), Error> {
             if !kvm.check_extension(cap) {
                 return Err(Error::KvmCap(cap));
@@ -280,14 +465,9 @@ impl KvmContext {
             Ok(())
         }
 
-        let kvm = if let Some(fd) = kvm_fd {
-            // Safe because we expect kvm_fd to contain a valid fd number when is_some() == true.
-            unsafe { Kvm::new_with_fd_number(fd) }
-        } else {
-            Kvm::new().map_err(Error::Kvm)?
-        };
+        let kvm = Kvm::new().map_err(Error::Kvm)?;
 
-        if kvm.get_api_version() != kvm::KVM_API_VERSION as i32 {
+        if kvm.get_api_version() != KVM_API_VERSION as i32 {
             return Err(Error::KvmApiVersion(kvm.get_api_version()));
         }
 
@@ -295,8 +475,12 @@ impl KvmContext {
         check_cap(&kvm, Cap::Ioeventfd)?;
         check_cap(&kvm, Cap::Irqfd)?;
         // check_cap(&kvm, Cap::ImmediateExit)?;
+        #[cfg(target_arch = "x86_64")]
         check_cap(&kvm, Cap::SetTssAddr)?;
         check_cap(&kvm, Cap::UserMemory)?;
+
+        #[cfg(target_arch = "aarch64")]
+        check_cap(&kvm, Cap::ArmPsci02)?;
 
         let max_memslots = kvm.get_nr_memslots();
         Ok(KvmContext { kvm, max_memslots })
@@ -336,7 +520,6 @@ impl MaybeHandler {
 }
 
 struct EpollEvent<T: AsRawFd> {
-    dispatch_index: u64,
     fd: T,
 }
 
@@ -424,23 +607,7 @@ impl EpollContext {
         .map_err(Error::EpollFd)?;
         self.dispatch_table.push(Some(token));
 
-        Ok(EpollEvent { dispatch_index, fd })
-    }
-
-    fn remove_event<T>(&mut self, epoll_event: EpollEvent<T>) -> Result<()>
-    where
-        T: AsRawFd,
-    {
-        epoll::ctl(
-            self.epoll_raw_fd,
-            epoll::ControlOptions::EPOLL_CTL_DEL,
-            epoll_event.fd.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, epoll_event.dispatch_index),
-        )
-        .map_err(Error::EpollFd)?;
-        self.dispatch_table[epoll_event.dispatch_index as usize] = None;
-
-        Ok(())
+        Ok(EpollEvent { fd })
     }
 
     fn allocate_tokens(&mut self, count: usize) -> (u64, Sender<Box<EpollHandler>>) {
@@ -460,27 +627,39 @@ impl EpollContext {
         (dispatch_base, sender)
     }
 
+    // See the below comment for `allocate_virtio_net_tokens`, for an explanation on the returned
+    // values.
     fn allocate_virtio_block_tokens(&mut self) -> (virtio::block::EpollConfig, usize) {
         let (dispatch_base, sender) = self.allocate_tokens(virtio::block::BLOCK_EVENTS_COUNT);
         (
             virtio::block::EpollConfig::new(dispatch_base, self.epoll_raw_fd, sender),
-            self.device_handlers.len(),
+            self.device_handlers.len() - 1,
         )
     }
 
-    fn allocate_virtio_net_tokens(&mut self) -> virtio::net::EpollConfig {
+    // Horrible, horrible hack, because velocity: return a tuple (epoll_config, handler_idx),
+    // since, for some reason, the VMM doesn't own and cannot contact its live devices. I.e.
+    // after VM start, the device objects become some kind of useless hollow husks, their
+    // actual data being _moved_ to their corresponding `EpollHandler`s.
+    // The `handler_idx`, that we're returning here, can be used by the VMM to contact the
+    // device, by faking an event, sent straight to the device `EpollHandler`.
+    fn allocate_virtio_net_tokens(&mut self) -> (virtio::net::EpollConfig, usize) {
         let (dispatch_base, sender) = self.allocate_tokens(virtio::net::NET_EVENTS_COUNT);
-        virtio::net::EpollConfig::new(dispatch_base, self.epoll_raw_fd, sender)
+        (
+            virtio::net::EpollConfig::new(dispatch_base, self.epoll_raw_fd, sender),
+            self.device_handlers.len() - 1,
+        )
     }
 
     #[cfg(feature = "vsock")]
     fn allocate_virtio_vsock_tokens(&mut self) -> virtio::vhost::handle::VhostEpollConfig {
-        let (dispatch_base, sender) = self.allocate_tokens(2);
+        let (dispatch_base, sender) =
+            self.allocate_tokens(virtio::vhost::handle::VHOST_EVENTS_COUNT);
         virtio::vhost::handle::VhostEpollConfig::new(dispatch_base, self.epoll_raw_fd, sender)
     }
 
     fn get_device_handler(&mut self, device_idx: usize) -> Result<&mut EpollHandler> {
-        let ref mut maybe = self.device_handlers[device_idx];
+        let maybe = &mut self.device_handlers[device_idx];
         match maybe.handler {
             Some(ref mut v) => Ok(v.as_mut()),
             None => {
@@ -492,7 +671,7 @@ impl EpollContext {
                 let received = maybe
                     .receiver
                     .try_recv()
-                    .map_err(|_| Error::GeneralFailure)?;
+                    .map_err(|_| Error::DeviceEventHandlerNotFound)?;
                 Ok(maybe.handler.get_or_insert(received).as_mut())
             }
         }
@@ -523,8 +702,7 @@ struct Vmm {
     // Guest VM core resources.
     guest_memory: Option<GuestMemory>,
     kernel_config: Option<KernelConfig>,
-    kill_signaled: Option<Arc<AtomicBool>>,
-    vcpu_handles: Option<Vec<thread::JoinHandle<()>>>,
+    vcpus_handles: Vec<thread::JoinHandle<()>>,
     exit_evt: Option<EpollEvent<EventFd>>,
     vm: Vm,
 
@@ -532,6 +710,7 @@ struct Vmm {
     mmio_device_manager: Option<MMIODeviceManager>,
     legacy_device_manager: LegacyDeviceManager,
     drive_handler_id_map: HashMap<String, usize>,
+    net_handler_id_map: HashMap<String, usize>,
 
     // Device configurations.
     // If there is a Root Block Device, this should be added as the first element of the list.
@@ -550,7 +729,6 @@ struct Vmm {
     write_metrics_event: EpollEvent<TimerFd>,
 
     // The level of seccomp filtering used. Seccomp filters are loaded before executing guest code.
-    // See `seccomp::SeccompLevel` for more information about seccomp levels.
     seccomp_level: u32,
 }
 
@@ -560,7 +738,6 @@ impl Vmm {
         api_event_fd: EventFd,
         from_api: Receiver<Box<VmmAction>>,
         seccomp_level: u32,
-        kvm_fd: Option<RawFd>,
     ) -> Result<Self> {
         let mut epoll_context = EpollContext::new()?;
         // If this fails, it's fatal; using expect() to crash.
@@ -577,7 +754,7 @@ impl Vmm {
             .expect("Cannot add write metrics TimerFd to epoll.");
 
         let block_device_configs = BlockDeviceConfigs::new();
-        let kvm = KvmContext::new(kvm_fd)?;
+        let kvm = KvmContext::new()?;
         let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
 
         Ok(Vmm {
@@ -586,14 +763,14 @@ impl Vmm {
             shared_info: api_shared_info,
             guest_memory: None,
             kernel_config: None,
-            kill_signaled: None,
-            vcpu_handles: None,
+            vcpus_handles: vec![],
             exit_evt: None,
             vm,
             mmio_device_manager: None,
             legacy_device_manager: LegacyDeviceManager::new().map_err(Error::CreateLegacyDevice)?,
             block_device_configs,
             drive_handler_id_map: HashMap::new(),
+            net_handler_id_map: HashMap::new(),
             network_interface_configs: NetworkInterfaceConfigs::new(),
             #[cfg(feature = "vsock")]
             vsock_device_configs: VsockDeviceConfigs::new(),
@@ -607,18 +784,25 @@ impl Vmm {
 
     fn update_drive_handler(
         &mut self,
-        drive_id: &String,
+        drive_id: &str,
         disk_image: File,
     ) -> result::Result<(), DriveError> {
         if let Some(device_idx) = self.drive_handler_id_map.get(drive_id) {
             match self.epoll_context.get_device_handler(*device_idx) {
                 Ok(handler) => {
-                    handler.handle_event(
+                    match handler.handle_event(
                         virtio::block::FS_UPDATE_EVENT,
                         *device_idx as u32,
                         EpollHandlerPayload::DrivePayload(disk_image),
-                    );
-                    Ok(())
+                    ) {
+                        Err(devices::Error::PayloadExpected) => {
+                            panic!("Received update disk image event with empty payload.")
+                        }
+                        Err(devices::Error::UnknownEvent { device, event }) => {
+                            panic!("Unknown event: {:?} {:?}", device, event)
+                        }
+                        _ => Ok(()),
+                    }
                 }
                 Err(e) => {
                     warn!("invalid handler for device {}: {:?}", device_idx, e);
@@ -665,7 +849,7 @@ impl Vmm {
                 .read(true)
                 .write(!drive_config.is_read_only)
                 .open(&drive_config.path_on_host)
-                .map_err(|e| StartMicrovmError::OpenBlockDevice(e))?;
+                .map_err(StartMicrovmError::OpenBlockDevice)?;
 
             if drive_config.is_root_device && drive_config.get_partuuid().is_some() {
                 kernel_config
@@ -684,21 +868,30 @@ impl Vmm {
                 }
             }
 
-            let (epoll_config, curr_device_idx) = epoll_context.allocate_virtio_block_tokens();
+            let (epoll_config, handler_idx) = epoll_context.allocate_virtio_block_tokens();
             self.drive_handler_id_map
-                .insert(drive_config.drive_id.clone(), curr_device_idx - 1);
+                .insert(drive_config.drive_id.clone(), handler_idx);
+            let rate_limiter = match drive_config.rate_limiter {
+                Some(rlim_cfg) => Some(
+                    rlim_cfg
+                        .into_rate_limiter()
+                        .map_err(StartMicrovmError::CreateRateLimiter)?,
+                ),
+                None => None,
+            };
 
             let block_box = Box::new(
                 devices::virtio::Block::new(
                     block_file,
                     drive_config.is_read_only,
                     epoll_config,
-                    drive_config.rate_limiter.take(),
+                    rate_limiter,
                 )
                 .map_err(StartMicrovmError::CreateBlockDevice)?,
             );
             device_manager
                 .register_device(
+                    self.vm.get_fd(),
                     block_box,
                     &mut kernel_config.cmdline,
                     Some(drive_config.drive_id.clone()),
@@ -720,11 +913,25 @@ impl Vmm {
             .ok_or(StartMicrovmError::MissingKernelConfig)?;
 
         for cfg in self.network_interface_configs.iter_mut() {
-            let epoll_config = self.epoll_context.allocate_virtio_net_tokens();
+            let (epoll_config, handler_idx) = self.epoll_context.allocate_virtio_net_tokens();
+            self.net_handler_id_map
+                .insert(cfg.iface_id.clone(), handler_idx);
 
             let allow_mmds_requests = cfg.allow_mmds_requests();
-            let rx_rate_limiter = cfg.rx_rate_limiter.take();
-            let tx_rate_limiter = cfg.tx_rate_limiter.take();
+            let rx_rate_limiter = match cfg.rx_rate_limiter {
+                Some(rlim) => Some(
+                    rlim.into_rate_limiter()
+                        .map_err(StartMicrovmError::CreateRateLimiter)?,
+                ),
+                None => None,
+            };
+            let tx_rate_limiter = match cfg.tx_rate_limiter {
+                Some(rlim) => Some(
+                    rlim.into_rate_limiter()
+                        .map_err(StartMicrovmError::CreateRateLimiter)?,
+                ),
+                None => None,
+            };
 
             if let Some(tap) = cfg.take_tap() {
                 let net_box = Box::new(
@@ -740,7 +947,7 @@ impl Vmm {
                 );
 
                 device_manager
-                    .register_device(net_box, &mut kernel_config.cmdline, None)
+                    .register_device(self.vm.get_fd(), net_box, &mut kernel_config.cmdline, None)
                     .map_err(StartMicrovmError::RegisterNetDevice)?;
             } else {
                 return Err(StartMicrovmError::NetDeviceNotConfigured)?;
@@ -764,11 +971,16 @@ impl Vmm {
             let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
 
             let vsock_box = Box::new(
-                devices::virtio::Vsock::new(cfg.guest_cid as u64, guest_mem, epoll_config)
+                devices::virtio::Vsock::new(u64::from(cfg.guest_cid), guest_mem, epoll_config)
                     .map_err(StartMicrovmError::CreateVsockDevice)?,
             );
             device_manager
-                .register_device(vsock_box, &mut kernel_config.cmdline, None)
+                .register_device(
+                    self.vm.get_fd(),
+                    vsock_box,
+                    &mut kernel_config.cmdline,
+                    None,
+                )
                 .map_err(StartMicrovmError::RegisterVsockDevice)?;
         }
         Ok(())
@@ -776,6 +988,38 @@ impl Vmm {
 
     fn configure_kernel(&mut self, kernel_config: KernelConfig) {
         self.kernel_config = Some(kernel_config);
+    }
+
+    fn flush_metrics(&mut self) -> std::result::Result<VmmData, VmmActionError> {
+        if let Err(e) = self.write_metrics() {
+            if let LoggerError::NeverInitialized(s) = e {
+                return Err(VmmActionError::Logger(
+                    ErrorKind::User,
+                    LoggerConfigError::FlushMetrics(s),
+                ));
+            } else {
+                return Err(VmmActionError::Logger(
+                    ErrorKind::Internal,
+                    LoggerConfigError::FlushMetrics(e.to_string()),
+                ));
+            }
+        }
+        Ok(VmmData::Empty)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn log_dirty_pages(&mut self) {
+        // If we're logging dirty pages, post the metrics on how many dirty pages there are.
+        if LOGGER.flags() | LogOption::LogDirtyPages as usize > 0 {
+            METRICS.memory.dirty_pages.add(self.get_dirty_page_count());
+        }
+    }
+
+    fn write_metrics(&mut self) -> result::Result<(), LoggerError> {
+        // The dirty pages are only available on x86_64.
+        #[cfg(target_arch = "x86_64")]
+        self.log_dirty_pages();
+        LOGGER.log_metrics()
     }
 
     fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicrovmError> {
@@ -786,9 +1030,19 @@ impl Vmm {
                 memory_model::GuestMemoryError::MemoryNotInitialized,
             ))?
             << 20;
-        let arch_mem_regions = x86_64::arch_memory_regions(mem_size);
+        let arch_mem_regions = arch::arch_memory_regions(mem_size);
         self.guest_memory =
             Some(GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?);
+        self.vm
+            .memory_init(
+                self.guest_memory
+                    .clone()
+                    .ok_or(StartMicrovmError::GuestMemory(
+                        memory_model::GuestMemoryError::MemoryNotInitialized,
+                    ))?,
+                &self.kvm,
+            )
+            .map_err(StartMicrovmError::ConfigureVm)?;
         Ok(())
     }
 
@@ -799,18 +1053,21 @@ impl Vmm {
         Ok(())
     }
 
-    fn init_devices(&mut self) -> std::result::Result<(), StartMicrovmError> {
+    fn attach_virtio_devices(&mut self) -> std::result::Result<(), StartMicrovmError> {
         let guest_mem = self
             .guest_memory
             .clone()
             .ok_or(StartMicrovmError::GuestMemory(
                 memory_model::GuestMemoryError::MemoryNotInitialized,
             ))?;
+
         // Instantiate the MMIO device manager.
-        // 'mmio_base' address has to be an address which is protected by the kernel, in this case
-        // the start of the x86 specific gap of memory (currently hardcoded at 768MiB).
-        let mut device_manager =
-            MMIODeviceManager::new(guest_mem.clone(), x86_64::get_32bit_gap_start() as u64);
+        // 'mmio_base' address has to be an address which is protected by the kernel.
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
 
         self.attach_block_devices(&mut device_manager)?;
         self.attach_net_devices(&mut device_manager)?;
@@ -821,38 +1078,35 @@ impl Vmm {
         Ok(())
     }
 
-    fn init_microvm(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        self.vm
-            .memory_init(
-                self.guest_memory
-                    .clone()
-                    .ok_or(StartMicrovmError::GuestMemory(
-                        memory_model::GuestMemoryError::MemoryNotInitialized,
-                    ))?,
-                &self.kvm,
-            )
-            .map_err(|e| StartMicrovmError::ConfigureVm(e))?;
+    #[cfg(target_arch = "x86_64")]
+    fn setup_interrupt_controller(&mut self) -> std::result::Result<(), StartMicrovmError> {
         self.vm
             .setup_irqchip(
                 &self.legacy_device_manager.com_evt_1_3,
                 &self.legacy_device_manager.com_evt_2_4,
+                &self.legacy_device_manager.kbd_evt,
             )
-            .map_err(|e| StartMicrovmError::ConfigureVm(e))?;
+            .map_err(StartMicrovmError::ConfigureVm)?;
+        #[cfg(target_arch = "x86_64")]
         self.vm
             .create_pit()
-            .map_err(|e| StartMicrovmError::ConfigureVm(e))?;
+            .map_err(StartMicrovmError::ConfigureVm)?;
+        Ok(())
+    }
 
-        // mmio_device_manager is instantiated in init_devices, which is called before init_microvm.
-        let device_manager = self
-            .mmio_device_manager
-            .as_ref()
-            .ok_or(StartMicrovmError::DeviceManager)?;
-        for request in &device_manager.vm_requests {
-            if let VmResponse::Err(e) = request.execute(self.vm.get_fd()) {
-                return Err(StartMicrovmError::DeviceVmRequest(e))?;
-            }
-        }
+    #[cfg(target_arch = "aarch64")]
+    fn setup_interrupt_controller(&mut self) -> std::result::Result<(), StartMicrovmError> {
+        let vcpu_count = self
+            .vm_config
+            .vcpu_count
+            .ok_or(StartMicrovmError::VcpusNotConfigured)?;
+        self.vm
+            .setup_irqchip(vcpu_count)
+            .map_err(StartMicrovmError::ConfigureVm)?;
+        Ok(())
+    }
 
+    fn attach_legacy_devices(&mut self) -> std::result::Result<(), StartMicrovmError> {
         self.legacy_device_manager
             .register_devices()
             .map_err(StartMicrovmError::LegacyIOBus)?;
@@ -860,184 +1114,90 @@ impl Vmm {
         Ok(())
     }
 
-    fn start_vcpus(
+    // On aarch64, the vCPUs need to be created (i.e call KVM_CREATE_VCPU) and configured before
+    // setting up the IRQ chip because the `KVM_CREATE_VCPU` ioctl will return error if the IRQCHIP
+    // was already initialized.
+    // Search for `kvm_arch_vcpu_create` in arch/arm/kvm/arm.c.
+    fn create_vcpus(
         &mut self,
         entry_addr: GuestAddress,
-    ) -> std::result::Result<(), StartMicrovmError> {
+        request_ts: TimestampUs,
+    ) -> std::result::Result<Vec<Vcpu>, StartMicrovmError> {
+        let vcpu_count = self
+            .vm_config
+            .vcpu_count
+            .ok_or(StartMicrovmError::VcpusNotConfigured)?;
+        let mut vcpus = Vec::with_capacity(vcpu_count as usize);
+
+        // `mmio_device_manager` is instantiated in `init_devices()`, which is called before
+        // `start_vcpus()`.
+        let device_manager = self
+            .mmio_device_manager
+            .as_ref()
+            .ok_or(StartMicrovmError::DeviceManager)?;
+
+        for cpu_id in 0..vcpu_count {
+            let io_bus = self.legacy_device_manager.io_bus.clone();
+            let mmio_bus = device_manager.bus.clone();
+            let mut vcpu = Vcpu::new(cpu_id, &self.vm, io_bus, mmio_bus, request_ts.clone())
+                .map_err(StartMicrovmError::Vcpu)?;
+            vcpu.configure(&self.vm_config, entry_addr, &self.vm)
+                .map_err(StartMicrovmError::VcpuConfigure)?;
+            vcpus.push(vcpu);
+        }
+        Ok(vcpus)
+    }
+
+    fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> std::result::Result<(), StartMicrovmError> {
         // vm_config has a default value for vcpu_count.
         let vcpu_count = self
             .vm_config
             .vcpu_count
             .ok_or(StartMicrovmError::VcpusNotConfigured)?;
-        self.vcpu_handles = Some(Vec::with_capacity(vcpu_count as usize));
-        // It is safe to unwrap since it's set just above.
-        let vcpu_handles = self.vcpu_handles.as_mut().unwrap();
-        self.kill_signaled = Some(Arc::new(AtomicBool::new(false)));
-        // It is safe to unwrap since it's set just above.
-        let kill_signaled = self.kill_signaled.as_mut().unwrap();
+        assert_eq!(
+            vcpus.len(),
+            vcpu_count as usize,
+            "The number of vCPU fds is corrupted!"
+        );
 
-        let vcpu_thread_barrier = Arc::new(Barrier::new((vcpu_count + 1) as usize));
+        self.vcpus_handles.reserve(vcpu_count as usize);
 
-        for cpu_id in 0..vcpu_count {
-            let io_bus = self.legacy_device_manager.io_bus.clone();
-            // mmio_device_manager is instantiated in init_devices, which is called before
-            // start_vcpus.
-            let device_manager = self
-                .mmio_device_manager
-                .as_ref()
-                .ok_or(StartMicrovmError::DeviceManager)?;
-            let mmio_bus = device_manager.bus.clone();
-            let kill_signaled = kill_signaled.clone();
-            let vcpu_thread_barrier = vcpu_thread_barrier.clone();
+        let vcpus_thread_barrier = Arc::new(Barrier::new((vcpu_count + 1) as usize));
+
+        // We're going in reverse so we can `.pop()` on the vec and still maintain order.
+        for cpu_id in (0..vcpu_count).rev() {
+            let vcpu_thread_barrier = vcpus_thread_barrier.clone();
             // If the lock is poisoned, it's OK to panic.
             let vcpu_exit_evt = self
                 .legacy_device_manager
                 .i8042
                 .lock()
                 .expect("Failed to start VCPUs due to poisoned i8042 lock")
-                .get_eventfd_clone()
+                .get_reset_evt_clone()
                 .map_err(|_| StartMicrovmError::EventFd)?;
 
-            let mut vcpu = Vcpu::new(cpu_id, &self.vm).map_err(StartMicrovmError::Vcpu)?;
+            // `unwrap` is safe since we are asserting that the `vcpu_count` is equal to the number
+            // of items of `vcpus` vector.
+            let mut vcpu = vcpus.pop().unwrap();
 
-            // It is safe to unwrap the ht_enabled flag because the machine configure
-            // has default values for all fields.
-            vcpu.configure(&self.vm_config, entry_addr, &self.vm)
-                .map_err(StartMicrovmError::VcpuConfigure)?;
-            vcpu_handles.push(
+            let seccomp_level = self.seccomp_level;
+            self.vcpus_handles.push(
                 thread::Builder::new()
                     .name(format!("fc_vcpu{}", cpu_id))
                     .spawn(move || {
-                        unsafe {
-                            extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {
-                            }
-                            // This uses an async signal safe handler to kill the vcpu handles.
-                            register_signal_handler(
-                                VCPU_RTSIG_OFFSET,
-                                sys_util::SignalHandler::Siginfo(handle_signal),
-                                true,
-                            )
-                            .expect("Failed to register vcpu signal handler");
-                        }
-
-                        vcpu_thread_barrier.wait();
-
-                        loop {
-                            match vcpu.run() {
-                                Ok(run) => match run {
-                                    VcpuExit::IoIn(addr, data) => {
-                                        io_bus.read(addr as u64, data);
-                                        METRICS.vcpu.exit_io_in.inc();
-                                    }
-                                    VcpuExit::IoOut(addr, data) => {
-                                        if addr == MAGIC_IOPORT_SIGNAL_GUEST_BOOT_COMPLETE
-                                            && data[0] == MAGIC_VALUE_SIGNAL_GUEST_BOOT_COMPLETE
-                                        {
-                                            let now_cpu_us = now_cputime_us();
-                                            let now_us =
-                                                chrono::Utc::now().timestamp_nanos() / 1000;
-
-                                            let boot_time_us = now_us as usize
-                                                - START_INSTANCE_REQUEST_TS.load(Ordering::Acquire);
-                                            let boot_time_cpu_us = now_cpu_us as usize
-                                                - START_INSTANCE_REQUEST_CPU_TS
-                                                    .load(Ordering::Acquire);
-                                            warn!(
-                                                "Guest-boot-time = {:>6} us {} ms, \
-                                                 {:>6} CPU us {} CPU ms",
-                                                boot_time_us,
-                                                boot_time_us / 1000,
-                                                boot_time_cpu_us,
-                                                boot_time_cpu_us / 1000
-                                            );
-                                        }
-                                        io_bus.write(addr as u64, data);
-                                        METRICS.vcpu.exit_io_out.inc();
-                                    }
-                                    VcpuExit::MmioRead(addr, data) => {
-                                        mmio_bus.read(addr, data);
-                                        METRICS.vcpu.exit_mmio_read.inc();
-                                    }
-                                    VcpuExit::MmioWrite(addr, data) => {
-                                        mmio_bus.write(addr, data);
-                                        METRICS.vcpu.exit_mmio_write.inc();
-                                    }
-                                    VcpuExit::Hlt => {
-                                        info!("Received KVM_EXIT_HLT signal");
-                                        break;
-                                    }
-                                    VcpuExit::Shutdown => {
-                                        info!("Received KVM_EXIT_SHUTDOWN signal");
-                                        break;
-                                    }
-                                    // Documentation specifies that below kvm exits are considered
-                                    // errors.
-                                    VcpuExit::FailEntry => {
-                                        METRICS.vcpu.failures.inc();
-                                        error!("Received KVM_EXIT_FAIL_ENTRY signal");
-                                        break;
-                                    }
-                                    VcpuExit::InternalError => {
-                                        METRICS.vcpu.failures.inc();
-                                        error!("Received KVM_EXIT_INTERNAL_ERROR signal");
-                                        break;
-                                    }
-                                    r => {
-                                        METRICS.vcpu.failures.inc();
-                                        // TODO: Are we sure we want to finish running a vcpu upon
-                                        // receiving a vm exit that is not necessarily an error?
-                                        error!("Unexpected exit reason on vcpu run: {:?}", r);
-                                        break;
-                                    }
-                                },
-                                Err(vstate::Error::VcpuRun(ref e)) => match e.errno() {
-                                    // Why do we check for these if we only return EINVAL?
-                                    libc::EAGAIN | libc::EINTR => {}
-                                    _ => {
-                                        METRICS.vcpu.failures.inc();
-                                        error!("Failure during vcpu run: {:?}", e);
-                                        break;
-                                    }
-                                },
-                                _ => (),
-                            }
-
-                            if kill_signaled.load(Ordering::SeqCst) {
-                                break;
-                            }
-                        }
-
-                        // Nothing we need do for the success case.
-                        if let Err(e) = vcpu_exit_evt.write(1) {
-                            METRICS.vcpu.failures.inc();
-                            error!("Failed signaling vcpu exit event: {:?}", e);
-                        }
+                        vcpu.run(vcpu_thread_barrier, seccomp_level, vcpu_exit_evt);
                     })
                     .map_err(StartMicrovmError::VcpuSpawn)?,
             );
         }
 
-        // Load seccomp filters before executing guest code.
+        // Load seccomp filters for the VMM thread.
         // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
         // altogether is the desired behaviour.
-        match self.seccomp_level {
-            SECCOMP_LEVEL_ADVANCED => {
-                setup_seccomp(SeccompLevel::Advanced(
-                    default_syscalls::default_context()
-                        .map_err(|e| StartMicrovmError::SeccompFilters(e))?,
-                ))
-                .map_err(|e| StartMicrovmError::SeccompFilters(e))?;
-            }
-            SECCOMP_LEVEL_BASIC => {
-                setup_seccomp(seccomp::SeccompLevel::Basic(
-                    default_syscalls::ALLOWED_SYSCALLS,
-                ))
-                .map_err(|e| StartMicrovmError::SeccompFilters(e))?;
-            }
-            SECCOMP_LEVEL_NONE | _ => {}
-        }
+        default_syscalls::set_seccomp_level(self.seccomp_level)
+            .map_err(StartMicrovmError::SeccompFilters)?;
 
-        vcpu_thread_barrier.wait();
+        vcpus_thread_barrier.wait();
 
         Ok(())
     }
@@ -1057,25 +1217,49 @@ impl Vmm {
         let vm_memory = self.vm.get_memory().ok_or(StartMicrovmError::GuestMemory(
             memory_model::GuestMemoryError::MemoryNotInitialized,
         ))?;
-        let entry_addr = kernel_loader::load_kernel(vm_memory, &mut kernel_config.kernel_file)
-            .map_err(|e| StartMicrovmError::Loader(e))?;
-        kernel_loader::load_cmdline(vm_memory, kernel_config.cmdline_addr, &cmdline_cstring)
-            .map_err(|e| StartMicrovmError::Loader(e))?;
+        let entry_addr = kernel_loader::load_kernel(
+            vm_memory,
+            &mut kernel_config.kernel_file,
+            arch::HIMEM_START,
+        )
+        .map_err(StartMicrovmError::KernelLoader)?;
 
+        // This is x86_64 specific since on aarch64 the commandline will be specified through the FDT.
+        #[cfg(target_arch = "x86_64")]
+        kernel_loader::load_cmdline(vm_memory, kernel_config.cmdline_addr, &cmdline_cstring)
+            .map_err(StartMicrovmError::LoadCommandline)?;
+
+        Ok(entry_addr)
+    }
+
+    fn configure_system(&mut self) -> std::result::Result<(), StartMicrovmError> {
+        let kernel_config = self
+            .kernel_config
+            .as_mut()
+            .ok_or(StartMicrovmError::MissingKernelConfig)?;
+        let cmdline_cstring = CString::new(kernel_config.cmdline.clone()).map_err(|_| {
+            StartMicrovmError::KernelCmdline(kernel_cmdline::Error::InvalidAscii.to_string())
+        })?;
+
+        // It is safe to unwrap because the VM memory was initialized before in vm.memory_init().
+        let vm_memory = self.vm.get_memory().ok_or(StartMicrovmError::GuestMemory(
+            memory_model::GuestMemoryError::MemoryNotInitialized,
+        ))?;
         // The vcpu_count has a default value. We shouldn't have gotten to this point without
         // having set the vcpu count.
         let vcpu_count = self
             .vm_config
             .vcpu_count
             .ok_or(StartMicrovmError::VcpusNotConfigured)?;
-        x86_64::configure_system(
+        #[cfg(target_arch = "x86_64")]
+        arch::x86_64::configure_system(
             vm_memory,
             kernel_config.cmdline_addr,
             cmdline_cstring.to_bytes().len() + 1,
             vcpu_count,
         )
-        .map_err(|e| StartMicrovmError::ConfigureSystem(e))?;
-        Ok(entry_addr)
+        .map_err(StartMicrovmError::ConfigureSystem)?;
+        Ok(())
     }
 
     fn register_events(&mut self) -> std::result::Result<(), StartMicrovmError> {
@@ -1085,7 +1269,7 @@ impl Vmm {
             .i8042
             .lock()
             .expect("Failed to register events on the event fd due to poisoned lock")
-            .get_eventfd_clone()
+            .get_reset_evt_clone()
             .map_err(|_| StartMicrovmError::EventFd)?;
         let exit_epoll_evt = self
             .epoll_context
@@ -1101,44 +1285,38 @@ impl Vmm {
     }
 
     fn start_microvm(&mut self) -> std::result::Result<VmmData, VmmActionError> {
-        START_INSTANCE_REQUEST_CPU_TS.store(now_cputime_us() as usize, Ordering::Release);
-        START_INSTANCE_REQUEST_TS.store(
-            (chrono::Utc::now().timestamp_nanos() / 1000) as usize,
-            Ordering::Release,
-        );
         info!("VMM received instance start command");
         if self.is_instance_initialized() {
-            return Err(VmmActionError::StartMicrovm(
-                ErrorKind::User,
-                StartMicrovmError::MicroVMAlreadyRunning,
-            ));
+            Err(StartMicrovmError::MicroVMAlreadyRunning)?;
         }
+        let request_ts = TimestampUs {
+            time_us: get_time_us(),
+            cputime_us: now_cputime_us(),
+        };
 
-        self.check_health()
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::User, e))?;
+        self.check_health()?;
         // Use expect() to crash if the other thread poisoned this lock.
         self.shared_info
             .write()
             .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
             .state = InstanceState::Starting;
 
-        self.init_guest_memory()
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::Internal, e))?;
+        self.init_guest_memory()?;
 
-        self.init_devices()
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::Internal, e))?;
-        self.init_microvm()
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::Internal, e))?;
+        self.setup_interrupt_controller()?;
 
-        let entry_addr = self
-            .load_kernel()
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::Internal, e))?;
+        self.attach_virtio_devices()?;
+        self.attach_legacy_devices()?;
 
-        self.register_events()
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::Internal, e))?;
-        self.start_vcpus(entry_addr)
-            .map_err(|e| VmmActionError::StartMicrovm(ErrorKind::Internal, e))?;
+        let entry_addr = self.load_kernel()?;
 
+        self.configure_system()?;
+
+        self.register_events()?;
+
+        let vcpus = self.create_vcpus(entry_addr, request_ts)?;
+
+        self.start_vcpus(vcpus)?;
         // Use expect() to crash if the other thread poisoned this lock.
         self.shared_info
             .write()
@@ -1156,46 +1334,26 @@ impl Vmm {
             .set_state(timer_state, SetTimeFlags::Default);
 
         // Log the metrics straight away to check the process startup time.
-        if let Err(_) = LOGGER.log_metrics() {
+        if LOGGER.log_metrics().is_err() {
             METRICS.logger.missed_metrics_count.inc();
         }
 
         Ok(VmmData::Empty)
     }
 
+    fn send_ctrl_alt_del(&mut self) -> std::result::Result<VmmData, VmmActionError> {
+        self.legacy_device_manager
+            .i8042
+            .lock()
+            .expect("i8042 lock was poisoned")
+            .trigger_ctrl_alt_del()
+            .map_err(|e| VmmActionError::SendCtrlAltDel(ErrorKind::Internal, e))?;
+        Ok(VmmData::Empty)
+    }
+
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
     fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");
-
-        if let Some(v) = self.kill_signaled.take() {
-            v.store(true, Ordering::SeqCst);
-        };
-
-        if let Some(handles) = self.vcpu_handles.take() {
-            for handle in handles {
-                match handle.kill(VCPU_RTSIG_OFFSET) {
-                    Ok(_) => {
-                        if let Err(e) = handle.join() {
-                            warn!("Failed to join vcpu thread: {:?}", e);
-                            METRICS.vcpu.failures.inc();
-                        }
-                    }
-                    Err(e) => {
-                        METRICS.vcpu.failures.inc();
-                        warn!("Failed to kill vcpu thread: {:?}", e)
-                    }
-                }
-            }
-        };
-
-        if let Some(evt) = self.exit_evt.take() {
-            if let Err(e) = self.epoll_context.remove_event(evt) {
-                warn!(
-                    "Cannot remove the exit event from the Epoll Context. {:?}",
-                    e
-                );
-            }
-        }
 
         if let Err(e) = self.epoll_context.disable_stdin_event() {
             warn!("Cannot disable the STDIN event. {:?}", e);
@@ -1215,8 +1373,11 @@ impl Vmm {
             error!("Failed to log metrics while stopping: {}", e);
         }
 
-        // Exit from Firecracker using the provided exit code.
-        std::process::exit(exit_code);
+        // Exit from Firecracker using the provided exit code. Safe because we're terminating
+        // the process anyway.
+        unsafe {
+            libc::_exit(exit_code);
+        }
     }
 
     fn is_instance_initialized(&self) -> bool {
@@ -1232,12 +1393,11 @@ impl Vmm {
         }
     }
 
+    #[allow(clippy::unused_label)]
     fn run_control(&mut self) -> Result<()> {
         const EPOLL_EVENTS_LEN: usize = 100;
 
-        let mut events = Vec::<epoll::Event>::with_capacity(EPOLL_EVENTS_LEN);
-        // Safe as we pass to set_len the value passed to with_capacity.
-        unsafe { events.set_len(EPOLL_EVENTS_LEN) };
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
 
         let epoll_raw_fd = self.epoll_context.epoll_raw_fd;
 
@@ -1245,8 +1405,8 @@ impl Vmm {
         'poll: loop {
             let num_events = epoll::wait(epoll_raw_fd, -1, &mut events[..]).map_err(Error::Poll)?;
 
-            for i in 0..num_events {
-                let dispatch_idx = events[i].data as usize;
+            for event in events.iter().take(num_events) {
+                let dispatch_idx = event.data as usize;
 
                 if let Some(dispatch_type) = self.epoll_context.dispatch_table[dispatch_idx] {
                     match dispatch_type {
@@ -1257,7 +1417,7 @@ impl Vmm {
                                 }
                                 None => warn!("leftover exit-evt in epollcontext!"),
                             }
-                            self.stop(0);
+                            self.stop(i32::from(FC_EXIT_CODE_OK));
                         }
                         EpollDispatch::Stdin => {
                             let mut out = [0u8; 64];
@@ -1288,11 +1448,21 @@ impl Vmm {
                         EpollDispatch::DeviceHandler(device_idx, device_token) => {
                             METRICS.vmm.device_events.inc();
                             match self.epoll_context.get_device_handler(device_idx) {
-                                Ok(handler) => handler.handle_event(
-                                    device_token,
-                                    events[i].events,
-                                    EpollHandlerPayload::Empty,
-                                ),
+                                Ok(handler) => {
+                                    match handler.handle_event(
+                                        device_token,
+                                        event.events,
+                                        EpollHandlerPayload::Empty,
+                                    ) {
+                                        Err(devices::Error::PayloadExpected) => panic!(
+                                            "Received update disk image event with empty payload."
+                                        ),
+                                        Err(devices::Error::UnknownEvent { device, event }) => {
+                                            panic!("Unknown event: {:?} {:?}", device, event)
+                                        }
+                                        _ => (),
+                                    }
+                                }
                                 Err(e) => {
                                     warn!("invalid handler for device {}: {:?}", device_idx, e)
                                 }
@@ -1302,11 +1472,15 @@ impl Vmm {
                             self.api_event.fd.read().map_err(Error::EventFd)?;
                             self.run_vmm_action().unwrap_or_else(|_| {
                                 warn!("got spurious notification from api thread");
-                                ()
                             });
                         }
                         EpollDispatch::WriteMetrics => {
-                            self.write_metrics();
+                            self.write_metrics_event.fd.read();
+                            // Please note that, since LOGGER has no output file configured yet, it will write to
+                            // stdout, so logging will interfere with console output.
+                            if let Err(e) = self.write_metrics() {
+                                error!("Failed to log metrics: {}", e);
+                            }
                         }
                     }
                 }
@@ -1326,7 +1500,7 @@ impl Vmm {
                     let bitmap = self
                         .vm
                         .get_fd()
-                        .get_and_reset_dirty_page_bitmap(slot as u32, memory_region.size());
+                        .get_dirty_log(slot as u32, memory_region.size());
                     match bitmap {
                         Ok(v) => v
                             .iter()
@@ -1339,19 +1513,6 @@ impl Vmm {
             return dirty_pages;
         }
         0
-    }
-
-    fn write_metrics(&mut self) {
-        self.write_metrics_event.fd.read();
-        // If we're logging dirty pages, post the metrics on how many dirty pages there are.
-        if LOGGER.flags() | LogOption::LogDirtyPages as usize > 0 {
-            METRICS.memory.dirty_pages.add(self.get_dirty_page_count());
-        }
-        // Please note that, since LOGGER has no output file configured yet, it will write to
-        // stdout, so logging will interfere with console output.
-        if let Err(e) = LOGGER.log_metrics() {
-            error!("Failed to log metrics: {}", e);
-        }
     }
 
     fn configure_boot_source(
@@ -1369,9 +1530,9 @@ impl Vmm {
         let kernel_file = File::open(kernel_image_path).map_err(|_| {
             VmmActionError::BootSource(ErrorKind::User, BootSourceConfigError::InvalidKernelPath)
         })?;
-        let mut cmdline = kernel_cmdline::Cmdline::new(x86_64::layout::CMDLINE_MAX_SIZE);
+        let mut cmdline = kernel_cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
         cmdline
-            .insert_str(kernel_cmdline.unwrap_or(String::from(DEFAULT_KERNEL_CMDLINE)))
+            .insert_str(kernel_cmdline.unwrap_or_else(|| String::from(DEFAULT_KERNEL_CMDLINE)))
             .map_err(|_| {
                 VmmActionError::BootSource(
                     ErrorKind::User,
@@ -1382,7 +1543,7 @@ impl Vmm {
         let kernel_config = KernelConfig {
             kernel_file,
             cmdline,
-            cmdline_addr: GuestAddress(x86_64::layout::CMDLINE_START),
+            cmdline_addr: GuestAddress(arch::CMDLINE_START),
         };
         self.configure_kernel(kernel_config);
 
@@ -1394,29 +1555,20 @@ impl Vmm {
         machine_config: VmConfig,
     ) -> std::result::Result<VmmData, VmmActionError> {
         if self.is_instance_initialized() {
-            return Err(VmmActionError::MachineConfig(
-                ErrorKind::User,
-                VmConfigError::UpdateNotAllowedPostBoot,
-            ));
+            Err(VmConfigError::UpdateNotAllowedPostBoot)?;
         }
 
         if let Some(vcpu_count_value) = machine_config.vcpu_count {
             // Check that the vcpu_count value is >=1.
-            if vcpu_count_value <= 0 {
-                return Err(VmmActionError::MachineConfig(
-                    ErrorKind::User,
-                    VmConfigError::InvalidVcpuCount,
-                ));
+            if vcpu_count_value == 0 {
+                Err(VmConfigError::InvalidVcpuCount)?;
             }
         }
 
         if let Some(mem_size_mib_value) = machine_config.mem_size_mib {
             // TODO: add other memory checks
-            if mem_size_mib_value <= 0 {
-                return Err(VmmActionError::MachineConfig(
-                    ErrorKind::User,
-                    VmConfigError::InvalidMemorySize,
-                ));
+            if mem_size_mib_value == 0 {
+                Err(VmConfigError::InvalidMemorySize)?;
             }
         }
 
@@ -1433,10 +1585,7 @@ impl Vmm {
         // If hyperthreading is enabled or is to be enabled in this call
         // only allow vcpu count to be 1 or even.
         if ht_enabled && vcpu_count_value > 1 && vcpu_count_value % 2 == 1 {
-            return Err(VmmActionError::MachineConfig(
-                ErrorKind::User,
-                VmConfigError::InvalidVcpuCount,
-            ));
+            Err(VmConfigError::InvalidVcpuCount)?;
         }
 
         // Update all the fields that have a new value.
@@ -1459,15 +1608,93 @@ impl Vmm {
         body: NetworkInterfaceConfig,
     ) -> std::result::Result<VmmData, VmmActionError> {
         if self.is_instance_initialized() {
-            return Err(VmmActionError::NetworkConfig(
-                ErrorKind::User,
-                NetworkInterfaceError::UpdateNotAllowedPostBoot,
-            ));
+            Err(NetworkInterfaceError::UpdateNotAllowedPostBoot)?;
         }
         self.network_interface_configs
             .insert(body)
             .map(|_| VmmData::Empty)
             .map_err(|e| VmmActionError::NetworkConfig(ErrorKind::User, e))
+    }
+
+    fn update_net_device(
+        &mut self,
+        new_cfg: NetworkInterfaceUpdateConfig,
+    ) -> std::result::Result<VmmData, VmmActionError> {
+        if !self.is_instance_initialized() {
+            // VM not started yet, so we only need to update the device configs, not the actual
+            // live device.
+            let old_cfg = self
+                .network_interface_configs
+                .iter_mut()
+                .find(|&&mut ref c| c.iface_id == new_cfg.iface_id)
+                .ok_or(NetworkInterfaceError::DeviceIdNotFound)?;
+
+            // Check if we need to update the RX rate limiter.
+            if let Some(new_rlim_cfg) = new_cfg.rx_rate_limiter {
+                if let Some(ref mut old_rlim_cfg) = old_cfg.rx_rate_limiter {
+                    // We already have an RX rate limiter set, so we'll update it.
+                    old_rlim_cfg.update(&new_rlim_cfg);
+                } else {
+                    // No old RX rate limiter; create one now.
+                    old_cfg.rx_rate_limiter = Some(new_rlim_cfg);
+                }
+            }
+
+            // Check if we need to update the TX rate limiter.
+            if let Some(new_rlim_cfg) = new_cfg.tx_rate_limiter {
+                if let Some(ref mut old_rlim_cfg) = old_cfg.tx_rate_limiter {
+                    // We already have a TX rate limiter set, so we'll update it.
+                    old_rlim_cfg.update(&new_rlim_cfg);
+                } else {
+                    // No old TX rate limiter; create one now.
+                    old_cfg.tx_rate_limiter = Some(new_rlim_cfg);
+                }
+            }
+
+            return Ok(VmmData::Empty);
+        }
+
+        // If we got to here, the VM is running. We need to update the live device.
+        //
+
+        let handler_id = *self
+            .net_handler_id_map
+            .get(&new_cfg.iface_id)
+            .ok_or(NetworkInterfaceError::DeviceIdNotFound)?;
+
+        let handler = self
+            .epoll_context
+            .get_device_handler(handler_id)
+            .map_err(NetworkInterfaceError::EpollHandlerNotFound)?;
+
+        // Hack because velocity (my new favorite phrase): fake an epoll event, because we can only
+        // contact a live device via its `EpollHandler`.
+        handler
+            .handle_event(
+                virtio::net::PATCH_RATE_LIMITERS_FAKE_EVENT,
+                handler_id as u32,
+                EpollHandlerPayload::NetRateLimiterPayload {
+                    rx_bytes: new_cfg
+                        .rx_rate_limiter
+                        .map(|rl| rl.bandwidth.map(|b| b.into_token_bucket()))
+                        .unwrap_or(None),
+                    rx_ops: new_cfg
+                        .rx_rate_limiter
+                        .map(|rl| rl.ops.map(|b| b.into_token_bucket()))
+                        .unwrap_or(None),
+                    tx_bytes: new_cfg
+                        .tx_rate_limiter
+                        .map(|rl| rl.bandwidth.map(|b| b.into_token_bucket()))
+                        .unwrap_or(None),
+                    tx_ops: new_cfg
+                        .tx_rate_limiter
+                        .map(|rl| rl.ops.map(|b| b.into_token_bucket()))
+                        .unwrap_or(None),
+                },
+            )
+            .map_err(NetworkInterfaceError::RateLimiterUpdateFailed)?;
+
+        Ok(VmmData::Empty)
     }
 
     #[cfg(feature = "vsock")]
@@ -1496,10 +1723,7 @@ impl Vmm {
         let block_device_index = self
             .block_device_configs
             .get_index_of_drive_id(&drive_id)
-            .ok_or(VmmActionError::DriveConfig(
-                ErrorKind::User,
-                DriveError::InvalidBlockDeviceID,
-            ))?;
+            .ok_or(DriveError::InvalidBlockDeviceID)?;
 
         let file_path = PathBuf::from(path_on_host);
         // Try to open the file specified by path_on_host using the permissions of the block_device.
@@ -1507,9 +1731,7 @@ impl Vmm {
             .read(true)
             .write(!self.block_device_configs.config_list[block_device_index].is_read_only())
             .open(&file_path)
-            .map_err(|_| {
-                VmmActionError::DriveConfig(ErrorKind::User, DriveError::CannotOpenBlockDevice)
-            })?;
+            .map_err(|_| DriveError::CannotOpenBlockDevice)?;
 
         // Update the path of the block device with the specified path_on_host.
         self.block_device_configs.config_list[block_device_index].path_on_host = file_path;
@@ -1517,8 +1739,7 @@ impl Vmm {
         // When the microvm is running, we also need to update the drive handler and send a
         // rescan command to the drive.
         if self.is_instance_initialized() {
-            self.update_drive_handler(&drive_id, disk_file)
-                .map_err(|e| VmmActionError::DriveConfig(ErrorKind::User, e))?;
+            self.update_drive_handler(&drive_id, disk_file)?;
             self.rescan_block_device(&drive_id)?;
         }
         Ok(VmmData::Empty)
@@ -1526,14 +1747,11 @@ impl Vmm {
 
     fn rescan_block_device(
         &mut self,
-        drive_id: &String,
+        drive_id: &str,
     ) -> std::result::Result<VmmData, VmmActionError> {
         // Rescan can only happen after the guest is booted.
         if !self.is_instance_initialized() {
-            return Err(VmmActionError::DriveConfig(
-                ErrorKind::User,
-                DriveError::OperationNotAllowedPreBoot,
-            ));
+            Err(DriveError::OperationNotAllowedPreBoot)?;
         }
 
         // Safe to unwrap() because mmio_device_manager is initialized in init_devices(), which is
@@ -1543,12 +1761,8 @@ impl Vmm {
             Some(&address) => {
                 for drive_config in self.block_device_configs.config_list.iter() {
                     if drive_config.drive_id == *drive_id {
-                        let metadata = metadata(&drive_config.path_on_host).map_err(|_| {
-                            VmmActionError::DriveConfig(
-                                ErrorKind::User,
-                                DriveError::BlockDeviceUpdateFailed,
-                            )
-                        })?;
+                        let metadata = metadata(&drive_config.path_on_host)
+                            .map_err(|_| DriveError::BlockDeviceUpdateFailed)?;
                         let new_size = metadata.len();
                         if new_size % virtio::block::SECTOR_SIZE != 0 {
                             warn!(
@@ -1561,23 +1775,12 @@ impl Vmm {
                         return device_manager
                             .update_drive(address, new_size)
                             .map(|_| VmmData::Empty)
-                            .map_err(|_| {
-                                VmmActionError::DriveConfig(
-                                    ErrorKind::User,
-                                    DriveError::BlockDeviceUpdateFailed,
-                                )
-                            });
+                            .map_err(|_| VmmActionError::from(DriveError::BlockDeviceUpdateFailed));
                     }
                 }
-                Err(VmmActionError::DriveConfig(
-                    ErrorKind::User,
-                    DriveError::BlockDeviceUpdateFailed,
-                ))
+                Err(VmmActionError::from(DriveError::BlockDeviceUpdateFailed))
             }
-            _ => Err(VmmActionError::DriveConfig(
-                ErrorKind::User,
-                DriveError::InvalidBlockDeviceID,
-            )),
+            _ => Err(VmmActionError::from(DriveError::InvalidBlockDeviceID)),
         }
     }
 
@@ -1588,16 +1791,13 @@ impl Vmm {
         block_device_config: BlockDeviceConfig,
     ) -> std::result::Result<VmmData, VmmActionError> {
         if self.is_instance_initialized() {
-            return Err(VmmActionError::DriveConfig(
-                ErrorKind::User,
-                DriveError::UpdateNotAllowedPostBoot,
-            ));
+            Err(DriveError::UpdateNotAllowedPostBoot)?;
         }
 
         self.block_device_configs
             .insert(block_device_config)
             .map(|_| VmmData::Empty)
-            .map_err(|e| VmmActionError::DriveConfig(ErrorKind::User, e))
+            .map_err(VmmActionError::from)
     }
 
     fn init_logger(
@@ -1614,39 +1814,34 @@ impl Vmm {
         }
 
         let instance_id;
+        let firecracker_version;
         {
             let guard = self.shared_info.read().unwrap();
             instance_id = guard.id.clone();
+            firecracker_version = guard.vmm_version.clone();
         }
 
         match api_logger.level {
-            Some(val) => match val {
-                LoggerLevel::Error => LOGGER.set_level(Level::Error),
-                LoggerLevel::Warning => LOGGER.set_level(Level::Warn),
-                LoggerLevel::Info => LOGGER.set_level(Level::Info),
-                LoggerLevel::Debug => LOGGER.set_level(Level::Debug),
-            },
-            None => (),
+            LoggerLevel::Error => LOGGER.set_level(Level::Error),
+            LoggerLevel::Warning => LOGGER.set_level(Level::Warn),
+            LoggerLevel::Info => LOGGER.set_level(Level::Info),
+            LoggerLevel::Debug => LOGGER.set_level(Level::Debug),
         }
 
-        if let Some(val) = api_logger.show_log_origin {
-            LOGGER.set_include_origin(val, val);
-        }
+        LOGGER.set_include_origin(api_logger.show_log_origin, api_logger.show_log_origin);
+        LOGGER.set_include_level(api_logger.show_level);
 
-        if let Some(val) = api_logger.show_level {
-            LOGGER.set_include_level(val);
-        }
-
-        let options = match api_logger.options {
-            Value::Array(options) => options,
-            _ => vec![],
-        };
+        #[cfg(target_arch = "aarch64")]
+        let options: &Vec<Value> = &vec![];
+        #[cfg(target_arch = "x86_64")]
+        let options = api_logger.options.as_array().unwrap();
 
         LOGGER
             .init(
+                &AppInfo::new("Firecracker", &firecracker_version),
                 &instance_id,
-                Some(api_logger.log_fifo),
-                Some(api_logger.metrics_fifo),
+                api_logger.log_fifo,
+                api_logger.metrics_fifo,
                 options,
             )
             .map(|_| VmmData::Empty)
@@ -1689,6 +1884,9 @@ impl Vmm {
             VmmAction::ConfigureLogger(logger_description, sender) => {
                 Vmm::send_response(self.init_logger(logger_description), sender);
             }
+            VmmAction::FlushMetrics(sender) => {
+                Vmm::send_response(self.flush_metrics(), sender);
+            }
             VmmAction::GetVmConfiguration(sender) => {
                 Vmm::send_response(
                     Ok(VmmData::MachineConfiguration(self.vm_config.clone())),
@@ -1711,14 +1909,35 @@ impl Vmm {
             VmmAction::StartMicroVm(sender) => {
                 Vmm::send_response(self.start_microvm(), sender);
             }
+            VmmAction::SendCtrlAltDel(sender) => {
+                Vmm::send_response(self.send_ctrl_alt_del(), sender);
+            }
             VmmAction::SetVmConfiguration(machine_config_body, sender) => {
                 Vmm::send_response(self.set_vm_configuration(machine_config_body), sender);
             }
             VmmAction::UpdateBlockDevicePath(drive_id, path_on_host, sender) => {
                 Vmm::send_response(self.set_block_device_path(drive_id, path_on_host), sender);
             }
+            VmmAction::UpdateNetworkInterface(netif_update, sender) => {
+                Vmm::send_response(self.update_net_device(netif_update), sender);
+            }
         };
         Ok(())
+    }
+
+    fn log_boot_time(t0_ts: &TimestampUs) {
+        let now_cpu_us = now_cputime_us();
+        let now_us = get_time_us();
+
+        let boot_time_us = now_us - t0_ts.time_us;
+        let boot_time_cpu_us = now_cpu_us - t0_ts.cputime_us;
+        info!(
+            "Guest-boot-time = {:>6} us {} ms, {:>6} CPU us {} CPU ms",
+            boot_time_us,
+            boot_time_us / 1000,
+            boot_time_cpu_us,
+            boot_time_cpu_us / 1000
+        );
     }
 }
 
@@ -1753,10 +1972,16 @@ impl PartialEq for VmmAction {
                 &VmmAction::InsertNetworkDevice(ref other_net_dev, _),
             ) => net_dev == other_net_dev,
             (
+                &VmmAction::UpdateNetworkInterface(ref net_dev, _),
+                &VmmAction::UpdateNetworkInterface(ref other_net_dev, _),
+            ) => net_dev == other_net_dev,
+            (
                 &VmmAction::RescanBlockDevice(ref req, _),
                 &VmmAction::RescanBlockDevice(ref other_req, _),
             ) => req == other_req,
             (&VmmAction::StartMicroVm(_), &VmmAction::StartMicroVm(_)) => true,
+            (&VmmAction::SendCtrlAltDel(_), &VmmAction::SendCtrlAltDel(_)) => true,
+            (&VmmAction::FlushMetrics(_), &VmmAction::FlushMetrics(_)) => true,
             _ => false,
         }
     }
@@ -1770,8 +1995,8 @@ impl PartialEq for VmmAction {
 /// * `api_event_fd` - An event fd used for receiving API associated events.
 /// * `from_api` - The receiver end point of the communication channel.
 /// * `seccomp_level` - The level of seccomp filtering used. Filters are loaded before executing
-///                     guest code.
-///                     See `seccomp::SeccompLevel` for more information about seccomp levels.
+///                     guest code. Can be one of 0 (seccomp disabled), 1 (filter by syscall
+///                     number) or 2 (filter by syscall number and argument values).
 /// * `kvm_fd` - Provides the option of supplying an already existing raw file descriptor
 ///              associated with `/dev/kvm`.
 pub fn start_vmm_thread(
@@ -1779,28 +2004,21 @@ pub fn start_vmm_thread(
     api_event_fd: EventFd,
     from_api: Receiver<Box<VmmAction>>,
     seccomp_level: u32,
-    kvm_fd: Option<RawFd>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("fc_vmm".to_string())
         .spawn(move || {
             // If this fails, consider it fatal. Use expect().
-            let mut vmm = Vmm::new(
-                api_shared_info,
-                api_event_fd,
-                from_api,
-                seccomp_level,
-                kvm_fd,
-            )
-            .expect("Cannot create VMM.");
+            let mut vmm = Vmm::new(api_shared_info, api_event_fd, from_api, seccomp_level)
+                .expect("Cannot create VMM");
             match vmm.run_control() {
                 Ok(()) => {
                     info!("Gracefully terminated VMM control loop");
-                    vmm.stop(0)
+                    vmm.stop(i32::from(FC_EXIT_CODE_OK))
                 }
                 Err(e) => {
                     error!("Abruptly exited VMM control loop: {:?}", e);
-                    vmm.stop(1)
+                    vmm.stop(i32::from(FC_EXIT_CODE_GENERIC_ERROR));
                 }
             }
         })
@@ -1813,13 +2031,31 @@ mod tests {
 
     use super::*;
 
+    use serde_json::Value;
     use std::fs::File;
+    use std::io::BufRead;
+    use std::io::BufReader;
     use std::sync::atomic::AtomicUsize;
 
     use self::tempfile::NamedTempFile;
     use devices::virtio::ActivateResult;
     use net_util::MacAddr;
     use vmm_config::machine_config::CpuFeaturesTemplate;
+    use vmm_config::{RateLimiterConfig, TokenBucketConfig};
+
+    fn good_kernel_file() -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let parent = path.parent().unwrap();
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        return [parent.to_str().unwrap(), "kernel/src/loader/test_elf.bin"]
+            .iter()
+            .collect();
+        #[cfg(target_arch = "aarch64")]
+        return [parent.to_str().unwrap(), "kernel/src/loader/test_pe.bin"]
+            .iter()
+            .collect();
+    }
 
     impl Vmm {
         fn get_kernel_cmdline_str(&self) -> &str {
@@ -1830,25 +2066,28 @@ mod tests {
             }
         }
 
-        fn remove_addr(&mut self, id: &String) {
+        fn remove_addr(&mut self, id: &str) {
             self.mmio_device_manager
                 .as_mut()
                 .unwrap()
                 .remove_address(id);
         }
 
-        fn default_kernel_config(&mut self) {
-            let kernel_file_temp =
+        fn default_kernel_config(&mut self, cust_kernel_path: Option<PathBuf>) {
+            let kernel_temp_file =
                 NamedTempFile::new().expect("Failed to create temporary kernel file.");
-            let kernel_path = String::from(kernel_file_temp.path().to_path_buf().to_str().unwrap());
-            let kernel_file = File::open(kernel_path).unwrap();
+            let mut kernel_path = kernel_temp_file.path().to_path_buf();
 
-            let mut cmdline = kernel_cmdline::Cmdline::new(x86_64::layout::CMDLINE_MAX_SIZE);
+            if cust_kernel_path.is_some() {
+                kernel_path = cust_kernel_path.unwrap();
+            }
+            let kernel_file = File::open(kernel_path).expect("Cannot open kernel file");
+            let mut cmdline = kernel_cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
             assert!(cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).is_ok());
             let kernel_cfg = KernelConfig {
                 cmdline,
                 kernel_file,
-                cmdline_addr: GuestAddress(x86_64::layout::CMDLINE_START),
+                cmdline_addr: GuestAddress(arch::CMDLINE_START),
             };
             self.configure_kernel(kernel_cfg);
         }
@@ -1888,10 +2127,11 @@ mod tests {
             device_event: DeviceEventT,
             event_flags: u32,
             payload: EpollHandlerPayload,
-        ) {
+        ) -> std::result::Result<(), devices::Error> {
             self.evt = Some(device_event);
             self.flags = Some(event_flags);
             self.payload = Some(payload);
+            Ok(())
         }
     }
 
@@ -1943,18 +2183,17 @@ mod tests {
         let shared_info = Arc::new(RwLock::new(InstanceInfo {
             state,
             id: "TEST_ID".to_string(),
+            vmm_version: "1.0".to_string(),
         }));
 
         let (_to_vmm, from_api) = channel();
-        let vmm = Vmm::new(
+        Vmm::new(
             shared_info,
             EventFd::new().expect("cannot create eventFD"),
             from_api,
             seccomp::SECCOMP_LEVEL_ADVANCED,
-            None,
         )
-        .expect("Cannot Create VMM");
-        return vmm;
+        .expect("Cannot Create VMM")
     }
 
     #[test]
@@ -2077,7 +2316,7 @@ mod tests {
         let network_interface = NetworkInterfaceConfig {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname2"),
-            guest_mac: Some(mac.clone()),
+            guest_mac: Some(mac),
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
@@ -2112,6 +2351,102 @@ mod tests {
     }
 
     #[test]
+    fn test_update_net_device() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+
+        let tbc_1mtps = TokenBucketConfig {
+            size: 1024 * 1024,
+            one_time_burst: None,
+            refill_time: 1000,
+        };
+        let tbc_2mtps = TokenBucketConfig {
+            size: 2 * 1024 * 1024,
+            one_time_burst: None,
+            refill_time: 1000,
+        };
+
+        vmm.insert_net_device(NetworkInterfaceConfig {
+            iface_id: String::from("1"),
+            host_dev_name: String::from("hostname5"),
+            guest_mac: None,
+            rx_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: Some(tbc_1mtps),
+                ops: None,
+            }),
+            tx_rate_limiter: None,
+            allow_mmds_requests: false,
+            tap: None,
+        })
+        .unwrap();
+
+        vmm.update_net_device(NetworkInterfaceUpdateConfig {
+            iface_id: "1".to_string(),
+            rx_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: None,
+                ops: Some(tbc_2mtps),
+            }),
+            tx_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: None,
+                ops: Some(tbc_2mtps),
+            }),
+        })
+        .unwrap();
+
+        {
+            let nic_1: &mut NetworkInterfaceConfig =
+                vmm.network_interface_configs.iter_mut().next().unwrap();
+            // The RX bandwidth should be unaffected.
+            assert_eq!(nic_1.rx_rate_limiter.unwrap().bandwidth.unwrap(), tbc_1mtps);
+            // The RX ops should be set to 2mtps.
+            assert_eq!(nic_1.rx_rate_limiter.unwrap().ops.unwrap(), tbc_2mtps);
+            // The TX bandwith should be unlimited (unaffected).
+            assert_eq!(nic_1.tx_rate_limiter.unwrap().bandwidth, None);
+            // The TX ops should be set to 2mtps.
+            assert_eq!(nic_1.tx_rate_limiter.unwrap().ops.unwrap(), tbc_2mtps);
+        }
+
+        vmm.init_guest_memory().unwrap();
+        vmm.default_kernel_config(None);
+        let guest_mem = vmm.guest_memory.clone().unwrap();
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
+        vmm.attach_net_devices(&mut device_manager).unwrap();
+        vmm.set_instance_state(InstanceState::Running);
+
+        // The update should fail before device activation.
+        assert!(vmm
+            .update_net_device(NetworkInterfaceUpdateConfig {
+                iface_id: "1".to_string(),
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            })
+            .is_err());
+
+        // Fake device activation by explicitly setting a dummy epoll handler.
+        vmm.epoll_context.device_handlers[0].handler = Some(Box::new(DummyEpollHandler {
+            evt: None,
+            flags: None,
+            payload: None,
+        }));
+        vmm.update_net_device(NetworkInterfaceUpdateConfig {
+            iface_id: "1".to_string(),
+            rx_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: Some(tbc_2mtps),
+                ops: None,
+            }),
+            tx_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: Some(tbc_1mtps),
+                ops: None,
+            }),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn test_machine_configuration() {
         let mut vmm = create_vmm_object(InstanceState::Uninitialized);
 
@@ -2236,16 +2571,13 @@ mod tests {
     }
 
     #[test]
-    fn add_remove_event_test() {
+    fn add_event_test() {
         let mut ep = EpollContext::new().unwrap();
         let evfd = EventFd::new().unwrap();
 
         // adding new event should work
         let epev = ep.add_event(evfd, EpollDispatch::Exit);
         assert!(epev.is_ok());
-
-        // removing event should work
-        assert!(ep.remove_event(epev.unwrap()).is_ok());
     }
 
     #[test]
@@ -2259,9 +2591,7 @@ mod tests {
         let epev = epev.unwrap();
 
         let evpoll_events_len = 10;
-        let mut events = Vec::<epoll::Event>::with_capacity(evpoll_events_len);
-        // Safe as we pass to set_len the value passed to with_capacity.
-        unsafe { events.set_len(evpoll_events_len) };
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); evpoll_events_len];
 
         // epoll should have no pending events
         let epollret = epoll::wait(ep.epoll_raw_fd, 0, &mut events[..]);
@@ -2283,63 +2613,6 @@ mod tests {
             *ep.dispatch_table[idx].as_ref().unwrap(),
             EpollDispatch::Exit
         );
-
-        // removing event should work
-        assert!(ep.remove_event(epev).is_ok());
-    }
-
-    #[test]
-    fn epoll_event_try_get_after_remove_test() {
-        let mut ep = EpollContext::new().unwrap();
-        let evfd = EventFd::new().unwrap();
-
-        // adding new event should work
-        let epev = ep.add_event(evfd, EpollDispatch::Exit).unwrap();
-
-        let evpoll_events_len = 10;
-        let mut events = Vec::<epoll::Event>::with_capacity(evpoll_events_len);
-        // Safe as we pass to set_len the value passed to with_capacity.
-        unsafe { events.set_len(evpoll_events_len) };
-
-        // raise the event
-        assert!(epev.fd.write(1).is_ok());
-
-        // removing event should work
-        assert!(ep.remove_event(epev).is_ok());
-
-        // epoll should have no pending events
-        let epollret = epoll::wait(ep.epoll_raw_fd, 0, &mut events[..]);
-        let num_events = epollret.unwrap();
-        assert_eq!(num_events, 0);
-    }
-
-    #[test]
-    fn epoll_event_try_use_after_remove_test() {
-        let mut ep = EpollContext::new().unwrap();
-        let evfd = EventFd::new().unwrap();
-
-        // adding new event should work
-        let epev = ep.add_event(evfd, EpollDispatch::Exit).unwrap();
-
-        let evpoll_events_len = 10;
-        let mut events = Vec::<epoll::Event>::with_capacity(evpoll_events_len);
-        // Safe as we pass to set_len the value passed to with_capacity.
-        unsafe { events.set_len(evpoll_events_len) };
-
-        // raise the event
-        assert!(epev.fd.write(1).is_ok());
-
-        // epoll should report one event
-        let epollret = epoll::wait(ep.epoll_raw_fd, 0, &mut events[..]);
-        let num_events = epollret.unwrap();
-        assert_eq!(num_events, 1);
-
-        // removing event should work
-        assert!(ep.remove_event(epev).is_ok());
-
-        // reported event should no longer be available
-        let idx = events[0].data as usize;
-        assert!(ep.dispatch_table[idx].is_none());
     }
 
     #[test]
@@ -2347,7 +2620,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::io::FromRawFd;
 
-        let c = KvmContext::new(None).unwrap();
+        let c = KvmContext::new().unwrap();
 
         assert!(c.max_memslots >= 32);
 
@@ -2411,11 +2684,14 @@ mod tests {
         assert!(vmm.init_guest_memory().is_ok());
         assert!(vmm.guest_memory.is_some());
 
-        vmm.default_kernel_config();
+        vmm.default_kernel_config(None);
 
         let guest_mem = vmm.guest_memory.clone().unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(guest_mem.clone(), x86_64::get_32bit_gap_start() as u64);
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         assert!(vmm.attach_block_devices(&mut device_manager).is_ok());
         assert!(vmm.get_kernel_cmdline_str().contains("root=/dev/vda"));
 
@@ -2435,11 +2711,14 @@ mod tests {
         assert!(vmm.init_guest_memory().is_ok());
         assert!(vmm.guest_memory.is_some());
 
-        vmm.default_kernel_config();
+        vmm.default_kernel_config(None);
 
         let guest_mem = vmm.guest_memory.clone().unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(guest_mem.clone(), x86_64::get_32bit_gap_start() as u64);
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         assert!(vmm.attach_block_devices(&mut device_manager).is_ok());
         assert!(vmm
             .get_kernel_cmdline_str()
@@ -2463,11 +2742,14 @@ mod tests {
         assert!(vmm.init_guest_memory().is_ok());
         assert!(vmm.guest_memory.is_some());
 
-        vmm.default_kernel_config();
+        vmm.default_kernel_config(None);
 
         let guest_mem = vmm.guest_memory.clone().unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(guest_mem.clone(), x86_64::get_32bit_gap_start() as u64);
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         assert!(vmm.attach_block_devices(&mut device_manager).is_ok());
         // Test that kernel commandline does not contain either /dev/vda or PARTUUID.
         assert!(!vmm.get_kernel_cmdline_str().contains("root=PARTUUID="));
@@ -2497,11 +2779,14 @@ mod tests {
         assert!(vmm.init_guest_memory().is_ok());
         assert!(vmm.guest_memory.is_some());
 
-        vmm.default_kernel_config();
+        vmm.default_kernel_config(None);
 
         let guest_mem = vmm.guest_memory.clone().unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(guest_mem.clone(), x86_64::get_32bit_gap_start() as u64);
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
 
         // test create network interface
         let network_interface = NetworkInterfaceConfig {
@@ -2525,10 +2810,10 @@ mod tests {
     #[test]
     fn test_init_devices() {
         let mut vmm = create_vmm_object(InstanceState::Uninitialized);
-        vmm.default_kernel_config();
+        vmm.default_kernel_config(None);
         assert!(vmm.init_guest_memory().is_ok());
 
-        assert!(vmm.init_devices().is_ok());
+        assert!(vmm.attach_virtio_devices().is_ok());
     }
 
     #[test]
@@ -2543,8 +2828,7 @@ mod tests {
         // Test valid kernel path and invalid cmdline.
         let kernel_file = NamedTempFile::new().expect("Failed to create temporary kernel file.");
         let kernel_path = String::from(kernel_file.path().to_path_buf().to_str().unwrap());
-        let invalid_cmdline =
-            String::from_utf8(vec![b'X'; x86_64::layout::CMDLINE_MAX_SIZE + 1]).unwrap();
+        let invalid_cmdline = String::from_utf8(vec![b'X'; arch::CMDLINE_MAX_SIZE + 1]).unwrap();
         assert!(vmm
             .configure_boot_source(kernel_path.clone(), Some(invalid_cmdline))
             .is_err());
@@ -2565,7 +2849,7 @@ mod tests {
     #[test]
     fn test_rescan() {
         let mut vmm = create_vmm_object(InstanceState::Uninitialized);
-        vmm.default_kernel_config();
+        vmm.default_kernel_config(None);
 
         let root_file = NamedTempFile::new().unwrap();
         let scratch_file = NamedTempFile::new().unwrap();
@@ -2597,15 +2881,19 @@ mod tests {
         assert!(vmm.guest_memory.is_some());
 
         let guest_mem = vmm.guest_memory.clone().unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(guest_mem.clone(), x86_64::get_32bit_gap_start() as u64);
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
 
         let dummy_box = Box::new(DummyDevice { dummy: 0 });
         // Use a dummy command line as it is not used in this test.
         let _addr = device_manager
             .register_device(
+                vmm.vm.get_fd(),
                 dummy_box,
-                &mut kernel_cmdline::Cmdline::new(x86_64::layout::CMDLINE_MAX_SIZE),
+                &mut kernel_cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE),
                 Some(scratch_id.clone()),
             )
             .unwrap();
@@ -2636,7 +2924,6 @@ mod tests {
         // Test rescan_block_device with invalid ID.
         match vmm.rescan_block_device(&"foo".to_string()) {
             Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::InvalidBlockDeviceID)) => {
-                ()
             }
             _ => assert!(false),
         }
@@ -2653,7 +2940,6 @@ mod tests {
         vmm.remove_addr(&scratch_id);
         match vmm.rescan_block_device(&scratch_id) {
             Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::InvalidBlockDeviceID)) => {
-                ()
             }
             _ => assert!(false),
         }
@@ -2680,9 +2966,10 @@ mod tests {
         let desc = LoggerConfig {
             log_fifo: log_file.path().to_str().unwrap().to_string(),
             metrics_fifo: metrics_file.path().to_str().unwrap().to_string(),
-            level: Some(LoggerLevel::Warning),
-            show_level: Some(true),
-            show_log_origin: Some(true),
+            level: LoggerLevel::Warning,
+            show_level: true,
+            show_log_origin: true,
+            #[cfg(target_arch = "x86_64")]
             options: Value::Array(vec![]),
         };
 
@@ -2696,9 +2983,10 @@ mod tests {
         let desc = LoggerConfig {
             log_fifo: String::from("not_found_file_log"),
             metrics_fifo: String::from("not_found_file_metrics"),
-            level: None,
-            show_level: None,
-            show_log_origin: None,
+            level: LoggerLevel::Warning,
+            show_level: false,
+            show_log_origin: false,
+            #[cfg(target_arch = "x86_64")]
             options: Value::Array(vec![]),
         };
         assert!(vmm.init_logger(desc).is_err());
@@ -2707,9 +2995,10 @@ mod tests {
         let desc = LoggerConfig {
             log_fifo: String::from("not_found_file_log"),
             metrics_fifo: String::from("not_found_file_metrics"),
-            level: None,
-            show_level: None,
-            show_log_origin: None,
+            level: LoggerLevel::Warning,
+            show_level: false,
+            show_log_origin: false,
+            #[cfg(target_arch = "x86_64")]
             options: Value::Array(vec![Value::String("foobar".to_string())]),
         };
         assert!(vmm.init_logger(desc).is_err());
@@ -2720,12 +3009,66 @@ mod tests {
         let desc = LoggerConfig {
             log_fifo: log_file.path().to_str().unwrap().to_string(),
             metrics_fifo: metrics_file.path().to_str().unwrap().to_string(),
-            level: Some(LoggerLevel::Warning),
-            show_level: Some(true),
-            show_log_origin: Some(true),
+            level: LoggerLevel::Info,
+            show_level: true,
+            show_log_origin: true,
+            #[cfg(target_arch = "x86_64")]
             options: Value::Array(vec![Value::String("LogDirtyPages".to_string())]),
         };
+        // Flushing metrics before initializing logger is erroneous.
+        let err = vmm.flush_metrics();
+        assert!(err.is_err());
+        assert_eq!(
+            format!("{:?}", err.unwrap_err()),
+            "Logger(Internal, FlushMetrics(\"Logger was not initialized.\"))"
+        );
+
         assert!(vmm.init_logger(desc).is_ok());
+
+        assert!(vmm.flush_metrics().is_ok());
+
+        let f = File::open(metrics_file).unwrap();
+        let mut reader = BufReader::new(f);
+
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("utc_timestamp_ms"));
+
+        // It is safe to do that because the tests are run sequentially (so no other test may be
+        // writing to the same file.
+        assert!(vmm.flush_metrics().is_ok());
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("utc_timestamp_ms"));
+
+        // Validate logfile works.
+        warn!("this is a test");
+
+        let f = File::open(log_file).unwrap();
+        let mut reader = BufReader::new(f);
+
+        let mut line = String::new();
+        loop {
+            if line.contains("this is a test") {
+                break;
+            }
+            if reader.read_line(&mut line).unwrap() == 0 {
+                // If it ever gets here, this assert will fail.
+                assert!(line.contains("this is a test"));
+            }
+        }
+
+        // Validate logging the boot time works.
+        Vmm::log_boot_time(&TimestampUs::default());
+        let mut line = String::new();
+        loop {
+            if line.contains("Guest-boot-time =") {
+                break;
+            }
+            if reader.read_line(&mut line).unwrap() == 0 {
+                // If it ever gets here, this assert will fail.
+                assert!(line.contains("Guest-boot-time ="));
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2734,5 +3077,537 @@ mod tests {
         let mut vmm = create_vmm_object(InstanceState::Uninitialized);
         assert_eq!(vmm.get_dirty_page_count(), 0);
         // Booting an actual guest and getting real data is covered by `kvm::tests::run_code_test`.
+    }
+
+    #[test]
+    fn test_create_vcpus() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        vmm.default_kernel_config(None);
+
+        assert!(vmm.init_guest_memory().is_ok());
+        assert!(vmm.vm.get_memory().is_some());
+
+        #[cfg(target_arch = "x86_64")]
+        // `KVM_CREATE_VCPU` fails if the irqchip is not created beforehand. This is x86_64 speciifc.
+        vmm.vm
+            .setup_irqchip(
+                &vmm.legacy_device_manager.com_evt_1_3,
+                &vmm.legacy_device_manager.com_evt_2_4,
+                &vmm.legacy_device_manager.kbd_evt,
+            )
+            .expect("Cannot create IRQCHIP");
+
+        let guest_mem = vmm.guest_memory.clone().unwrap();
+        let mut device_manager = MMIODeviceManager::new(
+            guest_mem.clone(),
+            arch::get_reserved_mem_addr() as u64,
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
+
+        let dummy_box = Box::new(DummyDevice { dummy: 0 });
+        // Use a dummy command line as it is not used in this test.
+        let _addr = device_manager
+            .register_device(
+                vmm.vm.get_fd(),
+                dummy_box,
+                &mut kernel_cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE),
+                Some("bogus".to_string()),
+            )
+            .unwrap();
+
+        vmm.mmio_device_manager = Some(device_manager);
+        assert!(vmm
+            .create_vcpus(GuestAddress(0x0), TimestampUs::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn test_setup_interrupt_controller() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        assert!(vmm.setup_interrupt_controller().is_ok());
+    }
+
+    #[test]
+    fn test_load_kernel() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        assert_eq!(
+            vmm.load_kernel().unwrap_err().to_string(),
+            "Cannot start microvm without kernel configuration."
+        );
+
+        vmm.default_kernel_config(None);
+
+        assert_eq!(
+            vmm.load_kernel().unwrap_err().to_string(),
+            "Invalid Memory Configuration: MemoryNotInitialized"
+        );
+
+        assert!(vmm.init_guest_memory().is_ok());
+        assert!(vmm.vm.get_memory().is_some());
+
+        assert_eq!(
+            vmm.load_kernel().unwrap_err().to_string(),
+            "Cannot load kernel due to invalid memory configuration or invalid kernel image. Failed to read ELF header"
+        );
+
+        vmm.default_kernel_config(Some(good_kernel_file()));
+        assert!(vmm.load_kernel().is_ok());
+    }
+
+    #[test]
+    fn test_configure_system() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        assert_eq!(
+            vmm.configure_system().unwrap_err().to_string(),
+            "Cannot start microvm without kernel configuration."
+        );
+
+        vmm.default_kernel_config(None);
+
+        assert_eq!(
+            vmm.configure_system().unwrap_err().to_string(),
+            "Invalid Memory Configuration: MemoryNotInitialized"
+        );
+
+        assert!(vmm.init_guest_memory().is_ok());
+        assert!(vmm.vm.get_memory().is_some());
+
+        assert!(vmm.configure_system().is_ok());
+    }
+
+    #[test]
+    fn test_attach_virtio_devices() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        vmm.default_kernel_config(None);
+
+        assert!(vmm.init_guest_memory().is_ok());
+        assert!(vmm.vm.get_memory().is_some());
+
+        // Create test network interface.
+        let network_interface = NetworkInterfaceConfig {
+            iface_id: String::from("netif"),
+            host_dev_name: String::from("hostname"),
+            guest_mac: None,
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
+            allow_mmds_requests: false,
+            tap: None,
+        };
+
+        assert!(vmm.insert_net_device(network_interface).is_ok());
+        assert!(vmm.attach_virtio_devices().is_ok());
+        assert!(vmm.mmio_device_manager.is_some());
+    }
+
+    #[test]
+    fn test_attach_legacy_devices() {
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+
+        assert!(vmm.attach_legacy_devices().is_ok());
+        assert!(vmm.legacy_device_manager.io_bus.get_device(0x3f8).is_some());
+        assert!(vmm.legacy_device_manager.io_bus.get_device(0x2f8).is_some());
+        assert!(vmm.legacy_device_manager.io_bus.get_device(0x3e8).is_some());
+        assert!(vmm.legacy_device_manager.io_bus.get_device(0x2e8).is_some());
+        assert!(vmm.legacy_device_manager.io_bus.get_device(0x060).is_some());
+        let stdin_handle = io::stdin();
+        stdin_handle.lock().set_canon_mode().unwrap();
+    }
+
+    // Helper function to get ErrorKind of error.
+    fn error_kind<T: std::convert::Into<VmmActionError>>(err: T) -> ErrorKind {
+        let err: VmmActionError = err.into();
+        err.kind().clone()
+    }
+
+    #[test]
+    fn test_error_conversion() {
+        // Test `DriveError` conversion
+        assert_eq!(
+            error_kind(DriveError::CannotOpenBlockDevice),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(DriveError::InvalidBlockDevicePath),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(DriveError::BlockDevicePathAlreadyExists),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(DriveError::BlockDeviceUpdateFailed),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(DriveError::OperationNotAllowedPreBoot),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(DriveError::UpdateNotAllowedPostBoot),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(DriveError::RootBlockDeviceAlreadyAdded),
+            ErrorKind::User
+        );
+
+        // Test `VmConfigError` conversion
+        assert_eq!(error_kind(VmConfigError::InvalidVcpuCount), ErrorKind::User);
+        assert_eq!(
+            error_kind(VmConfigError::InvalidMemorySize),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(VmConfigError::UpdateNotAllowedPostBoot),
+            ErrorKind::User
+        );
+
+        // Test `NetworkInterfaceError` conversion
+        assert_eq!(
+            error_kind(NetworkInterfaceError::GuestMacAddressInUse(String::new())),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(NetworkInterfaceError::EpollHandlerNotFound(
+                Error::DeviceEventHandlerNotFound
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(NetworkInterfaceError::HostDeviceNameInUse(String::new())),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(NetworkInterfaceError::DeviceIdNotFound),
+            ErrorKind::User
+        );
+        // NetworkInterfaceError::OpenTap can be of multiple kinds.
+        {
+            assert_eq!(
+                error_kind(NetworkInterfaceError::OpenTap(TapError::OpenTun(
+                    io::Error::from_raw_os_error(0)
+                ))),
+                ErrorKind::User
+            );
+            assert_eq!(
+                error_kind(NetworkInterfaceError::OpenTap(TapError::CreateTap(
+                    io::Error::from_raw_os_error(0)
+                ))),
+                ErrorKind::User
+            );
+            assert_eq!(
+                error_kind(NetworkInterfaceError::OpenTap(TapError::IoctlError(
+                    io::Error::from_raw_os_error(0)
+                ))),
+                ErrorKind::Internal
+            );
+            assert_eq!(
+                error_kind(NetworkInterfaceError::OpenTap(TapError::NetUtil(
+                    net_util::Error::CreateSocket(io::Error::from_raw_os_error(0))
+                ))),
+                ErrorKind::Internal
+            );
+            assert_eq!(
+                error_kind(NetworkInterfaceError::OpenTap(TapError::InvalidIfname)),
+                ErrorKind::User
+            );
+        }
+        assert_eq!(
+            error_kind(NetworkInterfaceError::RateLimiterUpdateFailed(
+                devices::Error::FailedReadTap
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(NetworkInterfaceError::UpdateNotAllowedPostBoot),
+            ErrorKind::User
+        );
+
+        // Test `StartMicrovmError` conversion
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            error_kind(StartMicrovmError::ConfigureSystem(
+                arch::Error::X86_64Setup(arch::x86_64::Error::ZeroPageSetup)
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::ConfigureVm(
+                vstate::Error::NotEnoughMemorySlots
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::CreateBlockDevice(
+                io::Error::from_raw_os_error(0)
+            )),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::CreateNetDevice(
+                devices::virtio::Error::TapOpen(TapError::CreateTap(io::Error::from_raw_os_error(
+                    0
+                )))
+            )),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::CreateRateLimiter(
+                io::Error::from_raw_os_error(0)
+            )),
+            ErrorKind::Internal
+        );
+        #[cfg(feature = "vsock")]
+        assert_eq!(
+            error_kind(StartMicrovmError::CreateVsockDevice(
+                devices::virtio::vhost::Error::PollError(io::Error::from_raw_os_error(0))
+            )),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::DeviceManager),
+            ErrorKind::Internal
+        );
+        assert_eq!(error_kind(StartMicrovmError::EventFd), ErrorKind::Internal);
+        assert_eq!(
+            error_kind(StartMicrovmError::GuestMemory(
+                memory_model::GuestMemoryError::NoMemoryRegions
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::KernelCmdline(String::new())),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::KernelLoader(
+                kernel_loader::Error::CommandLineOverflow
+            )),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::LegacyIOBus(
+                device_manager::legacy::Error::EventFd(io::Error::from_raw_os_error(0))
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::LoadCommandline(
+                kernel_loader::Error::CommandLineOverflow
+            )),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::MicroVMAlreadyRunning),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::MissingKernelConfig),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::NetDeviceNotConfigured),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::OpenBlockDevice(
+                io::Error::from_raw_os_error(0)
+            )),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::RegisterBlockDevice(
+                device_manager::mmio::Error::IrqsExhausted
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::RegisterEvent),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::RegisterNetDevice(
+                device_manager::mmio::Error::IrqsExhausted
+            )),
+            ErrorKind::Internal
+        );
+        #[cfg(feature = "vsock")]
+        assert_eq!(
+            error_kind(StartMicrovmError::RegisterVsockDevice(
+                device_manager::mmio::Error::IrqsExhausted
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::SeccompFilters(
+                seccomp::Error::InvalidArgumentNumber
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::Vcpu(vstate::Error::VcpuUnhandledKvmExit)),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::VcpuConfigure(
+                vstate::Error::SetSupportedCpusFailed(io::Error::from_raw_os_error(0))
+            )),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::VcpusNotConfigured),
+            ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::VcpuSpawn(io::Error::from_raw_os_error(
+                0
+            ))),
+            ErrorKind::Internal
+        );
+    }
+
+    #[test]
+    fn test_error_messages() {
+        // Enum `Error`
+
+        assert_eq!(
+            format!("{:?}", Error::ApiChannel),
+            "ApiChannel: error receiving data from the API server"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Error::CreateLegacyDevice(device_manager::legacy::Error::EventFd(
+                    io::Error::from_raw_os_error(42)
+                ))
+            ),
+            format!(
+                "Error creating legacy device: EventFd({:?})",
+                io::Error::from_raw_os_error(42)
+            )
+        );
+        assert_eq!(
+            format!("{:?}", Error::EpollFd(io::Error::from_raw_os_error(42))),
+            "Epoll fd error: No message of desired type (os error 42)"
+        );
+        assert_eq!(
+            format!("{:?}", Error::EventFd(io::Error::from_raw_os_error(42))),
+            "Event fd error: No message of desired type (os error 42)"
+        );
+        assert_eq!(
+            format!("{:?}", Error::DeviceEventHandlerNotFound),
+            "Device event handler not found. This might point to a guest device driver issue."
+        );
+        assert_eq!(
+            format!("{:?}", Error::Kvm(io::Error::from_raw_os_error(42))),
+            "Cannot open /dev/kvm. Error: No message of desired type (os error 42)"
+        );
+        assert_eq!(
+            format!("{:?}", Error::KvmApiVersion(42)),
+            "Bad KVM API version: 42"
+        );
+        assert_eq!(
+            format!("{:?}", Error::KvmCap(Cap::Hlt)),
+            "Missing KVM capability: Hlt"
+        );
+        assert_eq!(
+            format!("{:?}", Error::Poll(io::Error::from_raw_os_error(42))),
+            "Epoll wait failed: No message of desired type (os error 42)"
+        );
+        assert_eq!(
+            format!("{:?}", Error::Serial(io::Error::from_raw_os_error(42))),
+            format!(
+                "Error writing to the serial console: {:?}",
+                io::Error::from_raw_os_error(42)
+            )
+        );
+        assert_eq!(
+            format!("{:?}", Error::TimerFd(io::Error::from_raw_os_error(42))),
+            "Error creating timer fd: No message of desired type (os error 42)"
+        );
+        assert_eq!(
+            format!("{:?}", Error::Vm(vstate::Error::HTNotInitialized)),
+            "Error opening VM fd: HTNotInitialized"
+        );
+
+        // Enum `ErrorKind`
+
+        assert_eq!(format!("{:?}", ErrorKind::User), "User");
+        assert_eq!(format!("{:?}", ErrorKind::Internal), "Internal");
+
+        // Enum VmmActionError
+
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::BootSource(
+                    ErrorKind::User,
+                    BootSourceConfigError::InvalidKernelCommandLine
+                )
+            ),
+            "BootSource(User, InvalidKernelCommandLine)"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::DriveConfig(
+                    ErrorKind::User,
+                    DriveError::BlockDevicePathAlreadyExists
+                )
+            ),
+            "DriveConfig(User, BlockDevicePathAlreadyExists)"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::Logger(
+                    ErrorKind::User,
+                    LoggerConfigError::InitializationFailure(String::from("foobar"))
+                )
+            ),
+            "Logger(User, InitializationFailure(\"foobar\"))"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::MachineConfig(ErrorKind::User, VmConfigError::InvalidMemorySize)
+            ),
+            "MachineConfig(User, InvalidMemorySize)"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::NetworkConfig(
+                    ErrorKind::User,
+                    NetworkInterfaceError::DeviceIdNotFound
+                )
+            ),
+            "NetworkConfig(User, DeviceIdNotFound)"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::StartMicrovm(ErrorKind::User, StartMicrovmError::EventFd)
+            ),
+            "StartMicrovm(User, EventFd)"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::SendCtrlAltDel(
+                    ErrorKind::User,
+                    I8042DeviceError::InternalBufferFull
+                )
+            ),
+            "SendCtrlAltDel(User, InternalBufferFull)"
+        );
+        #[cfg(feature = "vsock")]
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::VsockConfig(ErrorKind::User, VsockError::UpdateNotAllowedPostBoot)
+            ),
+            "VsockConfig(User, UpdateNotAllowedPostBoot)"
+        );
     }
 }

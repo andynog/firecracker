@@ -46,12 +46,17 @@ impl Body {
 
     /// Returns the body as an `u8 slice`.
     pub fn raw(&self) -> &[u8] {
-        return self.body.as_slice();
+        self.body.as_slice()
     }
 
     /// Returns the length of the `Body`.
     pub fn len(&self) -> usize {
-        return self.body.len();
+        self.body.len()
+    }
+
+    /// Checks if the body is empty, ie with zero length
+    pub fn is_empty(&self) -> bool {
+        self.body.len() == 0
     }
 }
 
@@ -107,7 +112,7 @@ pub enum Version {
 
 impl Version {
     /// HTTP Version as an `u8 slice`.
-    pub fn raw(&self) -> &'static [u8] {
+    pub fn raw(self) -> &'static [u8] {
         match self {
             Version::Http10 => b"HTTP/1.0",
             Version::Http11 => b"HTTP/1.1",
@@ -171,5 +176,17 @@ mod tests {
             Method::try_from(b"PUT").unwrap_err(),
             RequestError::InvalidHttpMethod("Unsupported HTTP method.")
         );
+    }
+
+    #[test]
+    fn test_body() {
+        let body = Body::new("".to_string());
+        // Test for is_empty
+        assert!(body.is_empty());
+        let body = Body::new("This is a body.".to_string());
+        // Test for len
+        assert_eq!(body.len(), 15);
+        // Test for raw
+        assert_eq!(body.raw(), b"This is a body.");
     }
 }

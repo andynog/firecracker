@@ -8,7 +8,6 @@
 //! Implements virtio devices, queues, and transport mechanisms.
 use std;
 use std::io::Error as IOError;
-use sys_util::Error as SysError;
 
 pub mod block;
 mod mmio;
@@ -26,6 +25,7 @@ pub use self::vhost::vsock::*;
 
 use super::EpollHandlerPayload;
 
+const DEVICE_INIT: u32 = 0x0;
 const DEVICE_ACKNOWLEDGE: u32 = 0x01;
 const DEVICE_DRIVER: u32 = 0x02;
 const DEVICE_DRIVER_OK: u32 = 0x04;
@@ -47,8 +47,6 @@ pub const NOTIFY_REG_OFFSET: u32 = 0x50;
 
 #[derive(Debug)]
 pub enum ActivateError {
-    EventFd(SysError),
-    TryClone(SysError),
     EpollCtl(IOError),
     BadActivate,
     #[cfg(feature = "vsock")]

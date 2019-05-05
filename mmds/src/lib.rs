@@ -33,7 +33,7 @@ pub fn parse_request(request_bytes: &[u8]) -> Response {
     match request {
         Ok(request) => {
             let uri = request.uri().get_abs_path();
-            if uri.len() == 0 {
+            if uri.is_empty() {
                 return build_response(
                     request.http_version(),
                     StatusCode::BadRequest,
@@ -61,21 +61,21 @@ pub fn parse_request(request_bytes: &[u8]) -> Response {
                         MmdsError::NotFound => {
                             // NotFound
                             let error_msg = format!("Resource not found: {}.", uri);
-                            return build_response(
+                            build_response(
                                 request.http_version(),
                                 StatusCode::NotFound,
                                 Body::new(error_msg),
-                            );
+                            )
                         }
                         MmdsError::UnsupportedValueType => {
                             // InternalServerError
                             let error_msg =
                                 format!("The resource {} has an invalid format.", uri.to_string());
-                            return build_response(
+                            build_response(
                                 request.http_version(),
                                 StatusCode::InternalServerError,
                                 Body::new(error_msg),
-                            );
+                            )
                         }
                     }
                 }
@@ -126,7 +126,8 @@ mod tests {
         }"#;
         MMDS.lock()
             .unwrap()
-            .put_data(serde_json::from_str(data).unwrap());
+            .put_data(serde_json::from_str(data).unwrap())
+            .unwrap();
 
         // Test invalid request.
         let request = b"HTTP/1.1";
@@ -194,7 +195,6 @@ mod tests {
         assert!(expected_response.body().unwrap() == actual_response.body().unwrap());
         assert!(expected_response.http_version() == actual_response.http_version());
 
-        // Test Internal Server Error.
         let data = r#"{
             "name": {
                 "first": "John",
@@ -202,17 +202,11 @@ mod tests {
             },
             "age": 43
         }"#;
-        MMDS.lock()
-            .unwrap()
-            .put_data(serde_json::from_str(data).unwrap());
-
-        let request = b"GET http://169.254.169.254/age HTTP/1.0\r\n";
-        let mut expected_response = Response::new(Version::Http10, StatusCode::InternalServerError);
-        let body = format!("The resource /age has an invalid format.");
-        expected_response.set_body(Body::new(body));
-        let actual_response = parse_request(request);
-        assert!(expected_response.status() == actual_response.status());
-        assert!(expected_response.body().unwrap() == actual_response.body().unwrap());
-        assert!(expected_response.http_version() == actual_response.http_version());
+        assert_eq!(
+            MMDS.lock()
+                .unwrap()
+                .put_data(serde_json::from_str(data).unwrap()),
+            Err(MmdsError::UnsupportedValueType)
+        );
     }
 }

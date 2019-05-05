@@ -11,6 +11,7 @@ destroy microvms.
 """
 
 import os
+from queue import Queue
 import re
 from subprocess import run, PIPE
 
@@ -23,7 +24,7 @@ from framework.defs import MICROVM_KERNEL_RELPATH, MICROVM_FSFILES_RELPATH
 from framework.http import Session
 from framework.jailer import JailerContext
 from framework.resources import Actions, BootSource, Drive, Logger, MMDS, \
-    MachineConfigure, Network
+    MachineConfigure, Network, Vsock
 
 
 class Microvm:
@@ -42,12 +43,17 @@ class Microvm:
         fc_binary_path,
         jailer_binary_path,
         microvm_id,
+        build_feature='',
         monitor_memory=True,
-        newpid_cloner_path=None
+        aux_bin_paths=None
     ):
         """Set up microVM attributes, paths, and data structures."""
         # Unique identifier for this machine.
         self._microvm_id = microvm_id
+
+        # This is used in tests to identify if the microvm was started
+        # using a vsock build or a default build.
+        self.build_feature = build_feature
 
         # Compose the paths to the resources specific to this microvm.
         self._path = os.path.join(resource_path, microvm_id)
@@ -58,14 +64,16 @@ class Microvm:
 
         # The binaries this microvm will use to start.
         self._fc_binary_path = fc_binary_path
+        assert os.path.exists(self._fc_binary_path)
         self._jailer_binary_path = jailer_binary_path
+        assert os.path.exists(self._jailer_binary_path)
 
         # Create the jailer context associated with this microvm.
         self._jailer = JailerContext(
             jailer_id=self._microvm_id,
             exec_file=self._fc_binary_path
         )
-        self._jailer_clone_pid = None
+        self.jailer_clone_pid = None
 
         # Now deal with the things specific to the api session used to
         # communicate with this machine.
@@ -87,6 +95,7 @@ class Microvm:
         self.mmds = None
         self.network = None
         self.machine_cfg = None
+        self.vsock = None
 
         # The ssh config dictionary is populated with information about how
         # to connect to a microVM that has ssh capability. The path of the
@@ -98,21 +107,28 @@ class Microvm:
         }
 
         # Deal with memory monitoring.
-        self.monitor_memory = monitor_memory
+        if monitor_memory:
+            self._memory_events_queue = Queue()
+        else:
+            self._memory_events_queue = None
 
         # External clone/exec tool, because Python can't into clone
-        self.newpid_cloner_path = newpid_cloner_path
+        self.aux_bin_paths = aux_bin_paths
 
     def kill(self):
         """All clean up associated with this microVM should go here."""
         if self._jailer.daemonize:
-            if self._jailer_clone_pid:
-                run('kill -9 {}'.format(self._jailer_clone_pid), shell=True)
+            if self.jailer_clone_pid:
+                run('kill -9 {}'.format(self.jailer_clone_pid), shell=True)
         else:
             run(
                 'screen -XS {} kill'.format(self._session_name),
                 shell=True
             )
+
+        if self._memory_events_queue and not self._memory_events_queue.empty():
+            raise mem_tools.MemoryUsageExceededException(
+                self._memory_events_queue.get())
 
     @property
     def api_session(self):
@@ -181,6 +197,16 @@ class Microvm:
         """Set the dict values inside this configuration."""
         self._ssh_config.__setattr__(key, value)
 
+    @property
+    def memory_events_queue(self):
+        """Get the memory usage events queue."""
+        return self._memory_events_queue
+
+    @memory_events_queue.setter
+    def memory_events_queue(self, queue):
+        """Set the memory usage events queue."""
+        self._memory_events_queue = queue
+
     def create_jailed_resource(self, path):
         """Create a hard link to some resource inside this microvm."""
         return self.jailer.jailed_path(path, create=True)
@@ -227,12 +253,13 @@ class Microvm:
         self.boot = BootSource(self._api_socket, self._api_session)
         self.drive = Drive(self._api_socket, self._api_session)
         self.logger = Logger(self._api_socket, self._api_session)
-        self.mmds = MMDS(self._api_socket, self._api_session)
-        self.network = Network(self._api_socket, self._api_session)
         self.machine_cfg = MachineConfigure(
             self._api_socket,
             self._api_session
         )
+        self.mmds = MMDS(self._api_socket, self._api_session)
+        self.network = Network(self._api_socket, self._api_session)
+        self.vsock = Vsock(self._api_socket, self._api_session)
 
         jailer_param_list = self._jailer.construct_param_list()
 
@@ -247,15 +274,26 @@ class Microvm:
         # 2) Python's ctypes libc interface appears to be broken, causing
         # our clone / exec to deadlock at some point.
         if self._jailer.daemonize:
-            if self.newpid_cloner_path:
+            if self.aux_bin_paths:
                 _p = run(
-                    [self.newpid_cloner_path]
+                    [self.aux_bin_paths['cloner']]
                     + [self._jailer_binary_path]
                     + jailer_param_list,
                     stdout=PIPE,
+                    stderr=PIPE,
                     check=True
                 )
-                self._jailer_clone_pid = int(_p.stdout.decode().rstrip())
+                # Terrible hack to make the tests fail when starting the
+                # jailer fails with a panic. This is needed because we can't
+                # get the exit code of the jailer. In newpid_clone.c we are
+                # not waiting for the process and we always return 0 if the
+                # clone was successful (which in most cases will be) and we
+                # don't do anything if the jailer was not started
+                # successfully.
+                if _p.stderr.decode().strip():
+                    raise Exception(_p.stderr.decode())
+
+                self.jailer_clone_pid = int(_p.stdout.decode().rstrip())
             else:
                 # This code path is not used at the moment, but I just feel
                 # it's nice to have a fallback mechanism in place, in case
@@ -266,7 +304,7 @@ class Microvm:
                         self._jailer_binary_path,
                         [self._jailer_binary_path] + jailer_param_list
                     )
-                self._jailer_clone_pid = _pid
+                self.jailer_clone_pid = _pid
         else:
             start_cmd = 'screen -dmS {session} {binary} {params}'
             start_cmd = start_cmd.format(
@@ -281,17 +319,18 @@ class Microvm:
                 .stdout.decode('utf-8')
             screen_pid = re.search(r'([0-9]+)\.{}'.format(self._session_name),
                                    out).group(1)
-            self._jailer_clone_pid = open('/proc/{0}/task/{0}/children'
-                                          .format(screen_pid)
-                                          ).read().strip()
+            self.jailer_clone_pid = open('/proc/{0}/task/{0}/children'
+                                         .format(screen_pid)
+                                         ).read().strip()
 
-        # Wait for the jailer to create resources needed.
+        # Wait for the jailer to create resources needed, and Firecracker to
+        # create its API socket.
         # We expect the jailer to start within 80 ms. However, we wait for
-        # 1 sec since we are rechecking the existence of the socket 500 times
-        # and leave 0.002 delay between them.
+        # 1 sec since we are rechecking the existence of the socket 5 times
+        # and leave 0.2 delay between them.
         self._wait_create()
 
-    @retry(delay=0.100, tries=10)
+    @retry(delay=0.2, tries=5)
     def _wait_create(self):
         """Wait until the API socket and chroot folder are available."""
         os.stat(self._jailer.api_socket_path())
@@ -319,19 +358,20 @@ class Microvm:
             ht_enabled=ht_enabled,
             mem_size_mib=mem_size_mib
         )
-        assert self._api_session.is_good_response(response.status_code)
+        assert self._api_session.is_status_no_content(response.status_code)
 
-        if self.monitor_memory:
+        if self.memory_events_queue:
             mem_tools.threaded_memory_monitor(
                 mem_size_mib,
-                self._jailer_clone_pid
+                self.jailer_clone_pid,
+                self._memory_events_queue
             )
 
         # Add a kernel to start booting from.
         response = self.boot.put(
             kernel_image_path=self.create_jailed_resource(self.kernel_file)
         )
-        assert self._api_session.is_good_response(response.status_code)
+        assert self._api_session.is_status_no_content(response.status_code)
 
         if add_root_device:
             # Add the root file system with rw permissions.
@@ -341,7 +381,7 @@ class Microvm:
                 is_root_device=True,
                 is_read_only=False
             )
-            assert self._api_session.is_good_response(response.status_code)
+            assert self._api_session.is_status_no_content(response.status_code)
 
     def ssh_network_config(
             self,
@@ -387,7 +427,7 @@ class Microvm:
             tx_rate_limiter=tx_rate_limiter,
             rx_rate_limiter=rx_rate_limiter
         )
-        assert self._api_session.is_good_response(response.status_code)
+        assert self._api_session.is_status_no_content(response.status_code)
 
         self.ssh_config['hostname'] = guest_ip
         return tap, host_ip, guest_ip
@@ -398,4 +438,4 @@ class Microvm:
         This function has asserts to validate that the microvm boot success.
         """
         response = self.actions.put(action_type='InstanceStart')
-        assert self._api_session.is_good_response(response.status_code)
+        assert self._api_session.is_status_no_content(response.status_code)

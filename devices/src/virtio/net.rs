@@ -20,18 +20,18 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use super::super::Error as DeviceError;
 use super::{
     ActivateError, ActivateResult, EpollHandlerPayload, Queue, VirtioDevice, TYPE_NET,
     VIRTIO_MMIO_INT_VRING,
 };
-use dumbo::ns::MmdsNetworkStack;
+use dumbo::{ns::MmdsNetworkStack, pdu::ethernet::EthernetFrame};
 use logger::{Metric, METRICS};
 use memory_model::{GuestAddress, GuestMemory};
 use net_gen;
 use net_util::{MacAddr, Tap, TapError, MAC_ADDR_LEN};
 use rate_limiter::{RateLimiter, TokenType};
 use sys_util::EventFd;
-use virtio_gen::virtio_config::*;
 use virtio_gen::virtio_net::*;
 use {DeviceEventT, EpollHandler};
 
@@ -41,7 +41,7 @@ use {DeviceEventT, EpollHandler};
 const MAX_BUFFER_SIZE: usize = 65562;
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 2;
-const QUEUE_SIZES: &'static [u16] = &[QUEUE_SIZE; NUM_QUEUES];
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
 // A frame is available for reading from the tap device to receive in the guest.
 const RX_TAP_EVENT: DeviceEventT = 0;
@@ -55,6 +55,11 @@ const RX_RATE_LIMITER_EVENT: DeviceEventT = 3;
 const TX_RATE_LIMITER_EVENT: DeviceEventT = 4;
 // Number of DeviceEventT events supported by this implementation.
 pub const NET_EVENTS_COUNT: usize = 5;
+
+// This is not a true DeviceEvent, as we explicitly invoke the handler with this value as a
+// parameter when the VMM handles as PATCH rate limiters request. Thus, there's not epoll event
+// associated with it.
+pub const PATCH_RATE_LIMITERS_FAKE_EVENT: DeviceEventT = NET_EVENTS_COUNT as DeviceEventT;
 
 #[derive(Debug)]
 pub enum Error {
@@ -79,7 +84,6 @@ struct TxVirtio {
     rate_limiter: RateLimiter,
     queue: Queue,
     iovec: Vec<(GuestAddress, usize)>,
-    used_desc_heads: [u16; QUEUE_SIZE as usize],
     frame_buf: [u8; MAX_BUFFER_SIZE],
 }
 
@@ -91,7 +95,6 @@ impl TxVirtio {
             rate_limiter,
             queue,
             iovec: Vec::with_capacity(tx_queue_max_size),
-            used_desc_heads: [0u16; QUEUE_SIZE as usize],
             frame_buf: [0u8; MAX_BUFFER_SIZE],
         }
     }
@@ -139,8 +142,8 @@ fn frame_bytes_from_buf_mut(buf: &mut [u8]) -> &mut [u8] {
 fn init_vnet_hdr(buf: &mut [u8]) {
     // The buffer should be larger than vnet_hdr_len.
     // TODO: any better way to set all these bytes to 0? Or is this optimized by the compiler?
-    for i in 0..vnet_hdr_len() {
-        buf[i] = 0;
+    for i in &mut buf[0..vnet_hdr_len()] {
+        *i = 0;
     }
 }
 
@@ -156,19 +159,21 @@ struct NetEpollHandler {
     #[allow(dead_code)]
     acked_features: u64,
     mmds_ns: Option<MmdsNetworkStack>,
+    guest_mac: Option<MacAddr>,
 
     #[cfg(test)]
     test_mutators: tests::TestMutators,
 }
 
 impl NetEpollHandler {
-    fn signal_used_queue(&self) {
+    fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
-        if let Err(e) = self.interrupt_evt.write(1) {
+        self.interrupt_evt.write(1).map_err(|e| {
             error!("Failed to signal used queue: {:?}", e);
             METRICS.net.event_fails.inc();
-        }
+            DeviceError::FailedSignalingUsedQueue(e)
+        })
     }
 
     // Attempts to copy a single frame into the guest if there is enough
@@ -204,7 +209,7 @@ impl NetEpollHandler {
                 .rate_limiter
                 .manual_replenish(self.rx.bytes_read as u64, TokenType::Bytes);
         }
-        return success;
+        success
     }
 
     // Copies a single frame from `self.rx.frame_buf` into the guest. Returns true
@@ -266,9 +271,9 @@ impl NetEpollHandler {
         if write_count >= self.rx.bytes_read {
             METRICS.net.rx_bytes_count.add(write_count);
             METRICS.net.rx_packets_count.inc();
-            return true;
+            true
         } else {
-            return false;
+            false
         }
     }
 
@@ -281,6 +286,7 @@ impl NetEpollHandler {
         rate_limiter: &mut RateLimiter,
         frame_buf: &[u8],
         tap: &mut Tap,
+        guest_mac: Option<MacAddr>,
     ) -> bool {
         if let Some(ns) = mmds_ns {
             if ns.detour_frame(frame_bytes_from_buf(frame_buf)) {
@@ -294,7 +300,19 @@ impl NetEpollHandler {
                 return true;
             }
         }
+
         // This frame goes to the TAP.
+
+        // Check for guest MAC spoofing.
+        if let Some(mac) = guest_mac {
+            let _ = EthernetFrame::from_bytes(&frame_buf[vnet_hdr_len()..]).and_then(|eth_frame| {
+                if mac != eth_frame.src_mac() {
+                    METRICS.net.tx_spoofed_mac_count.inc();
+                }
+                Ok(())
+            });
+        }
+
         let write_result = tap.write(frame_buf);
         match write_result {
             Ok(_) => {
@@ -324,7 +342,7 @@ impl NetEpollHandler {
         self.read_tap()
     }
 
-    fn process_rx(&mut self) {
+    fn process_rx(&mut self) -> result::Result<(), DeviceError> {
         // Read as many frames as possible.
         loop {
             match self.read_from_mmds_or_tap() {
@@ -343,6 +361,7 @@ impl NetEpollHandler {
                         _ => {
                             error!("Failed to read tap: {:?}", e);
                             METRICS.net.rx_fails.inc();
+                            return Err(DeviceError::FailedReadTap);
                         }
                     };
                     break;
@@ -351,27 +370,32 @@ impl NetEpollHandler {
         }
         if self.rx.deferred_irqs {
             self.rx.deferred_irqs = false;
-            self.signal_used_queue();
+            self.signal_used_queue()
+        } else {
+            Ok(())
         }
     }
 
-    fn resume_rx(&mut self) {
+    fn resume_rx(&mut self) -> result::Result<(), DeviceError> {
         if self.rx.deferred_frame {
             if self.rate_limited_rx_single_frame() {
                 self.rx.deferred_frame = false;
                 // process_rx() was interrupted possibly before consuming all
                 // packets in the tap; try continuing now.
-                self.process_rx();
+                self.process_rx()
             } else if self.rx.deferred_irqs {
                 self.rx.deferred_irqs = false;
-                self.signal_used_queue();
+                self.signal_used_queue()
+            } else {
+                Ok(())
             }
+        } else {
+            Ok(())
         }
     }
 
-    fn process_tx(&mut self) {
+    fn process_tx(&mut self) -> result::Result<(), DeviceError> {
         let mut rate_limited = false;
-        let mut used_count = 0;
 
         // The MMDS network stack works like a state machine, based on synchronous calls, and
         // without being added to any event loop. If any frame is accepted by the MMDS, we also
@@ -379,7 +403,7 @@ impl NetEpollHandler {
         // with the MMDS network stack.
         let mut process_rx_for_mmds = false;
 
-        for avail_desc in self.tx.queue.iter(&self.mem) {
+        while let Some(avail_desc) = self.tx.queue.iter(&self.mem).next() {
             // If limiter.consume() fails it means there is no more TokenType::Ops
             // budget and rate limiting is in effect.
             if !self.tx.rate_limiter.consume(1, TokenType::Ops) {
@@ -393,20 +417,13 @@ impl NetEpollHandler {
             let mut next_desc = Some(avail_desc);
 
             self.tx.iovec.clear();
-            loop {
-                match next_desc {
-                    Some(desc) => {
-                        if desc.is_write_only() {
-                            break;
-                        }
-                        self.tx.iovec.push((desc.addr, desc.len as usize));
-                        read_count += desc.len as usize;
-                        next_desc = desc.next_descriptor();
-                    }
-                    None => {
-                        break;
-                    }
+            while let Some(desc) = next_desc {
+                if desc.is_write_only() {
+                    break;
                 }
+                self.tx.iovec.push((desc.addr, desc.len as usize));
+                read_count += desc.len as usize;
+                next_desc = desc.next_descriptor();
             }
 
             // If limiter.consume() fails it means there is no more TokenType::Bytes
@@ -449,16 +466,16 @@ impl NetEpollHandler {
             if Self::write_to_mmds_or_tap(
                 self.mmds_ns.as_mut(),
                 &mut self.tx.rate_limiter,
-                &mut self.tx.frame_buf[..read_count],
+                &self.tx.frame_buf[..read_count],
                 &mut self.tap,
+                self.guest_mac,
             ) && !self.rx.deferred_frame
             {
                 // MMDS consumed this frame/request, let's also try to process the response.
                 process_rx_for_mmds = true;
             }
 
-            self.tx.used_desc_heads[used_count] = head_index;
-            used_count += 1;
+            self.tx.queue.add_used(&self.mem, head_index, 0);
         }
         if rate_limited {
             // If rate limiting kicked in, queue had advanced one element that we aborted
@@ -466,19 +483,11 @@ impl NetEpollHandler {
             self.tx.queue.go_to_previous_position();
         }
 
-        if used_count != 0 {
-            // TODO(performance - Issue #425): find a way around RUST mutability enforcements to
-            // allow calling queue.add_used() inside the loop. This would lead to better distribution
-            // of descriptor usage between the firecracker thread and the guest tx thread.
-            // One option to do this is to call queue.add_used() from a static function.
-            for &desc_index in &self.tx.used_desc_heads[..used_count] {
-                self.tx.queue.add_used(&self.mem, desc_index, 0);
-            }
-        }
-
         // An incoming frame for the MMDS may trigger the transmission of a new message.
         if process_rx_for_mmds {
-            self.process_rx();
+            self.process_rx()
+        } else {
+            Ok(())
         }
     }
 
@@ -489,53 +498,70 @@ impl NetEpollHandler {
 }
 
 impl EpollHandler for NetEpollHandler {
-    fn handle_event(&mut self, device_event: DeviceEventT, _: u32, _: EpollHandlerPayload) {
+    fn handle_event(
+        &mut self,
+        device_event: DeviceEventT,
+        _: u32,
+        payload: EpollHandlerPayload,
+    ) -> result::Result<(), DeviceError> {
         match device_event {
-            RX_TAP_EVENT => {
-                METRICS.net.rx_tap_event_count.inc();
-
-                // While limiter is blocked, don't process any more incoming.
-                if self.rx.rate_limiter.is_blocked() {
-                    return;
-                }
-                // Process a deferred frame first if available. Don't read from tap again
-                // until we manage to receive this deferred frame.
-                if self.rx.deferred_frame {
-                    if self.rate_limited_rx_single_frame() {
-                        self.rx.deferred_frame = false;
-                    } else {
-                        if self.rx.deferred_irqs {
-                            self.rx.deferred_irqs = false;
-                            self.signal_used_queue();
-                        }
-                        return;
-                    }
-                }
-                self.process_rx();
-            }
             RX_QUEUE_EVENT => {
                 METRICS.net.rx_queue_event_count.inc();
                 if let Err(e) = self.rx.queue_evt.read() {
                     error!("Failed to get rx queue event: {:?}", e);
                     METRICS.net.event_fails.inc();
-                    // Shouldn't we return here?
+                    Err(DeviceError::FailedReadingQueue {
+                        event_type: "rx queue event",
+                        underlying: e,
+                    })
+                } else {
+                    // If the limiter is not blocked, resume the receiving of bytes.
+                    if !self.rx.rate_limiter.is_blocked() {
+                        // There should be a buffer available now to receive the frame into.
+                        self.resume_rx()
+                    } else {
+                        Ok(())
+                    }
                 }
-                // If the limiter is not blocked, resume the receiving of bytes.
-                if !self.rx.rate_limiter.is_blocked() {
-                    // There should be a buffer available now to receive the frame into.
-                    self.resume_rx();
+            }
+            RX_TAP_EVENT => {
+                METRICS.net.rx_tap_event_count.inc();
+
+                // While limiter is blocked, don't process any more incoming.
+                if self.rx.rate_limiter.is_blocked() {
+                    Ok(())
+                } else if self.rx.deferred_frame
+                // Process a deferred frame first if available. Don't read from tap again
+                // until we manage to receive this deferred frame.
+                {
+                    if self.rate_limited_rx_single_frame() {
+                        self.rx.deferred_frame = false;
+                        self.process_rx()
+                    } else if self.rx.deferred_irqs {
+                        self.rx.deferred_irqs = false;
+                        self.signal_used_queue()
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    self.process_rx()
                 }
             }
             TX_QUEUE_EVENT => {
                 METRICS.net.tx_queue_event_count.inc();
                 if let Err(e) = self.tx.queue_evt.read() {
                     error!("Failed to get tx queue event: {:?}", e);
-                    // Shouldn't we return here?
                     METRICS.net.event_fails.inc();
-                }
+                    Err(DeviceError::FailedReadingQueue {
+                        event_type: "tx queue event",
+                        underlying: e,
+                    })
+                } else if !self.tx.rate_limiter.is_blocked()
                 // If the limiter is not blocked, continue transmitting bytes.
-                if !self.tx.rate_limiter.is_blocked() {
-                    self.process_tx();
+                {
+                    self.process_tx()
+                } else {
+                    Ok(())
                 }
             }
             RX_RATE_LIMITER_EVENT => {
@@ -545,11 +571,12 @@ impl EpollHandler for NetEpollHandler {
                 match self.rx.rate_limiter.event_handler() {
                     Ok(_) => {
                         // There might be enough budget now to receive the frame.
-                        self.resume_rx();
+                        self.resume_rx()
                     }
                     Err(e) => {
                         METRICS.net.event_fails.inc();
-                        error!("Failed to get rx rate-limiter event: {:?}", e)
+                        error!("Failed to get rx rate-limiter event: {:?}", e);
+                        Err(DeviceError::RateLimited(e))
                     }
                 }
             }
@@ -560,15 +587,34 @@ impl EpollHandler for NetEpollHandler {
                 match self.tx.rate_limiter.event_handler() {
                     Ok(_) => {
                         // There might be enough budget now to send the frame.
-                        self.process_tx();
+                        self.process_tx()
                     }
                     Err(e) => {
                         METRICS.net.event_fails.inc();
-                        error!("Failed to get tx rate-limiter event: {:?}", e)
+                        error!("Failed to get tx rate-limiter event: {:?}", e);
+                        Err(DeviceError::RateLimited(e))
                     }
                 }
             }
-            _ => panic!("Unknown event type was received."),
+            PATCH_RATE_LIMITERS_FAKE_EVENT => {
+                if let EpollHandlerPayload::NetRateLimiterPayload {
+                    rx_bytes,
+                    rx_ops,
+                    tx_bytes,
+                    tx_ops,
+                } = payload
+                {
+                    self.rx.rate_limiter.update_buckets(rx_bytes, rx_ops);
+                    self.tx.rate_limiter.update_buckets(tx_bytes, tx_ops);
+                    Ok(())
+                } else {
+                    Err(DeviceError::PayloadExpected)
+                }
+            }
+            other => Err(DeviceError::UnknownEvent {
+                device: "net",
+                event: other,
+            }),
         }
     }
 }
@@ -590,11 +636,11 @@ impl EpollConfig {
         sender: mpsc::Sender<Box<EpollHandler>>,
     ) -> Self {
         EpollConfig {
-            rx_tap_token: first_token + RX_TAP_EVENT as u64,
-            rx_queue_token: first_token + RX_QUEUE_EVENT as u64,
-            tx_queue_token: first_token + TX_QUEUE_EVENT as u64,
-            rx_rate_limiter_token: first_token + RX_RATE_LIMITER_EVENT as u64,
-            tx_rate_limiter_token: first_token + TX_RATE_LIMITER_EVENT as u64,
+            rx_tap_token: first_token + u64::from(RX_TAP_EVENT),
+            rx_queue_token: first_token + u64::from(RX_QUEUE_EVENT),
+            tx_queue_token: first_token + u64::from(TX_QUEUE_EVENT),
+            rx_rate_limiter_token: first_token + u64::from(RX_RATE_LIMITER_EVENT),
+            tx_rate_limiter_token: first_token + u64::from(TX_RATE_LIMITER_EVENT),
             epoll_raw_fd,
             sender,
         }
@@ -692,6 +738,16 @@ impl Net {
             allow_mmds_requests,
         )
     }
+
+    fn guest_mac(&self) -> Option<MacAddr> {
+        if self.config_space.len() < MAC_ADDR_LEN {
+            None
+        } else {
+            Some(MacAddr::from_bytes_unchecked(
+                &self.config_space[..MAC_ADDR_LEN],
+            ))
+        }
+    }
 }
 
 impl VirtioDevice for Net {
@@ -716,8 +772,8 @@ impl VirtioDevice for Net {
 
     fn ack_features(&mut self, page: u32, value: u32) {
         let mut v = match page {
-            0 => value as u64,
-            1 => (value as u64) << 32,
+            0 => u64::from(value),
+            1 => u64::from(value) << 32,
             _ => {
                 warn!("Cannot acknowledge unknown features page: {}", page);
                 0u64
@@ -743,7 +799,7 @@ impl VirtioDevice for Net {
         }
         if let Some(end) = offset.checked_add(data.len() as u64) {
             // This write can't fail, offset and end are checked against config_len.
-            data.write(&self.config_space[offset as usize..cmp::min(end, config_len) as usize])
+            data.write_all(&self.config_space[offset as usize..cmp::min(end, config_len) as usize])
                 .unwrap();
         }
     }
@@ -784,10 +840,11 @@ impl VirtioDevice for Net {
             let tx_queue = queues.remove(0);
             let rx_queue_evt = queue_evts.remove(0);
             let tx_queue_evt = queue_evts.remove(0);
-            let mut mmds_ns = None;
-            if self.allow_mmds_requests {
-                mmds_ns = Some(MmdsNetworkStack::new_with_defaults());
-            }
+            let mut mmds_ns = if self.allow_mmds_requests {
+                Some(MmdsNetworkStack::new_with_defaults())
+            } else {
+                None
+            };
             let handler = NetEpollHandler {
                 rx: RxVirtio::new(
                     rx_queue,
@@ -805,6 +862,7 @@ impl VirtioDevice for Net {
                 interrupt_evt,
                 acked_features: self.acked_features,
                 mmds_ns,
+                guest_mac: self.guest_mac(),
 
                 #[cfg(test)]
                 test_mutators: tests::TestMutators::default(),
@@ -905,12 +963,13 @@ mod tests {
     use virtio::queue::tests::*;
 
     use dumbo::pdu::{arp, ethernet};
+    use rate_limiter::TokenBucket;
 
     /// Will read $metric, run the code in $block, then assert metric has increased by $delta.
     macro_rules! check_metric_after_block {
         ($metric:expr, $delta:expr, $block:expr) => {{
             let before = $metric.count();
-            $block;
+            let _ = $block;
             assert_eq!($metric.count(), before + $delta, "unexpected metric value");
         }};
     }
@@ -1017,7 +1076,7 @@ mod tests {
             let ret = self.rx_single_frame();
             if self.rx.deferred_irqs {
                 self.rx.deferred_irqs = false;
-                self.signal_used_queue();
+                let _ = self.signal_used_queue();
             }
             ret
         }
@@ -1055,6 +1114,7 @@ mod tests {
         n.activate(mem.clone(), interrupt_evt, status, queues, queue_evts)
     }
 
+    #[allow(clippy::needless_lifetimes)]
     fn default_test_netepollhandler<'a>(
         mem: &'a GuestMemory,
         test_mutators: TestMutators,
@@ -1085,6 +1145,7 @@ mod tests {
                 acked_features: n.acked_features,
                 mmds_ns: Some(MmdsNetworkStack::new_with_defaults()),
                 test_mutators,
+                guest_mac: None,
             },
             txq,
             rxq,
@@ -1113,6 +1174,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn test_virtio_device() {
         let mac = MacAddr::parse_str("11:22:33:44:55:66").unwrap();
         let mut dummy = DummyNet::new(Some(&mac));
@@ -1330,6 +1392,7 @@ mod tests {
                 &mut h.tx.rate_limiter,
                 &h.tx.frame_buf[..packet_len],
                 &mut h.tap,
+                Some(sha),
             ))
         );
 
@@ -1338,6 +1401,75 @@ mod tests {
             &METRICS.mmds.tx_frames,
             1,
             h.read_from_mmds_or_tap().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_mac_spoofing_detection() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
+
+        let guest_mac = MacAddr::parse_str("11:11:11:11:11:11").unwrap();
+        let not_guest_mac = MacAddr::parse_str("33:33:33:33:33:33").unwrap();
+        let guest_ip = Ipv4Addr::new(10, 1, 2, 3);
+        let dst_mac = MacAddr::parse_str("22:22:22:22:22:22").unwrap();
+        let dst_ip = Ipv4Addr::new(10, 1, 1, 1);
+
+        let packet_len;
+        {
+            // Create an ethernet frame.
+            let eth_frame_i = ethernet::EthernetFrame::write_incomplete(
+                frame_bytes_from_buf_mut(&mut h.tx.frame_buf),
+                dst_mac,
+                guest_mac,
+                ethernet::ETHERTYPE_ARP,
+            )
+            .ok()
+            .unwrap();
+            // Set its length to hold an ARP request.
+            let mut eth_frame_complete =
+                eth_frame_i.with_payload_len_unchecked(arp::ETH_IPV4_FRAME_LEN);
+
+            // Save the total frame length.
+            packet_len =
+                vnet_hdr_len() + eth_frame_complete.payload_offset() + arp::ETH_IPV4_FRAME_LEN;
+
+            // Create the ARP request.
+            let arp_req = arp::EthIPv4ArpFrame::write_request(
+                eth_frame_complete.payload_mut(),
+                guest_mac,
+                guest_ip,
+                dst_mac,
+                dst_ip,
+            );
+            // Validate success.
+            assert!(arp_req.is_ok());
+        }
+
+        // Check that a legit MAC doesn't affect the spoofed MAC metric.
+        check_metric_after_block!(
+            &METRICS.net.tx_spoofed_mac_count,
+            0,
+            NetEpollHandler::write_to_mmds_or_tap(
+                h.mmds_ns.as_mut(),
+                &mut h.tx.rate_limiter,
+                &h.tx.frame_buf[..packet_len],
+                &mut h.tap,
+                Some(guest_mac),
+            )
+        );
+
+        // Check that a spoofed MAC increases our spoofed MAC metric.
+        check_metric_after_block!(
+            &METRICS.net.tx_spoofed_mac_count,
+            1,
+            NetEpollHandler::write_to_mmds_or_tap(
+                h.mmds_ns.as_mut(),
+                &mut h.tx.rate_limiter,
+                &h.tx.frame_buf[..packet_len],
+                &mut h.tap,
+                Some(not_guest_mac),
+            )
         );
     }
 
@@ -1364,16 +1496,64 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_invalid_event_handler() {
         let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
-        // This should panic because the event is invalid.
-        h.handle_event(
-            NET_EVENTS_COUNT as DeviceEventT,
-            0,
-            EpollHandlerPayload::Empty,
-        );
+
+        let bad_event = 1000;
+
+        let r = h.handle_event(bad_event as DeviceEventT, 0, EpollHandlerPayload::Empty);
+        match r {
+            Err(DeviceError::UnknownEvent { event, device }) => {
+                assert_eq!(event, bad_event as DeviceEventT);
+                assert_eq!(device, "net");
+            }
+            _ => panic!("invalid"),
+        }
+    }
+
+    // Cannot easily test failures for:
+    //  * queue_evt.read (rx and tx)
+    //  * interrupt_evt.write
+
+    #[test]
+    fn test_read_tap_fail_event_handler() {
+        let test_mutators = TestMutators {
+            tap_read_fail: true,
+        };
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, test_mutators);
+        let r = h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
+        match r {
+            Err(DeviceError::FailedReadTap) => (),
+            _ => panic!("invalid"),
+        }
+    }
+
+    #[test]
+    fn test_rx_rate_limited_event_handler() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
+        let rl = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
+        h.set_rx_rate_limiter(rl);
+        let r = h.handle_event(RX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty);
+        match r {
+            Err(DeviceError::RateLimited(_)) => (),
+            _ => panic!("invalid"),
+        }
+    }
+
+    #[test]
+    fn test_tx_rate_limited_event_handler() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
+        let rl = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
+        h.set_tx_rate_limiter(rl);
+        let r = h.handle_event(TX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty);
+        match r {
+            Err(DeviceError::RateLimited(_)) => (),
+            _ => panic!("invalid"),
+        }
     }
 
     #[test]
@@ -1404,7 +1584,7 @@ mod tests {
                 h.rx.queue = rxq.create_queue();
                 h.interrupt_evt.write(1).unwrap();
                 // The prev rx_single_frame_no_irq_coalescing() call should have written one more.
-                assert_eq!(h.interrupt_evt.read(), Ok(2));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 2);
             }
 
             {
@@ -1421,7 +1601,7 @@ mod tests {
                 rxq.used.idx.set(0);
                 h.rx.queue = rxq.create_queue();
                 h.interrupt_evt.write(1).unwrap();
-                assert_eq!(h.interrupt_evt.read(), Ok(2));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 2);
             }
 
             // set rx_count back to 0
@@ -1437,7 +1617,8 @@ mod tests {
             txq.dtable[0].set(daddr, 0x1000, 0, 0);
 
             h.tx.queue_evt.write(1).unwrap();
-            h.handle_event(TX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty);
+            h.handle_event(TX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty)
+                .unwrap();
             // Make sure the data queue advanced.
             assert_eq!(txq.used.idx.get(), 1);
         }
@@ -1453,9 +1634,10 @@ mod tests {
             rxq.dtable[0].set(daddr, 0x1000, VIRTQ_DESC_F_WRITE, 0);
 
             h.interrupt_evt.write(1).unwrap();
-            h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
+            h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty)
+                .unwrap();
             assert!(h.rx.deferred_frame);
-            assert_eq!(h.interrupt_evt.read(), Ok(2));
+            assert_eq!(h.interrupt_evt.read().unwrap(), 2);
             // The #cfg(test) enabled version of read_tap always returns 1234 bytes (or the len of
             // the buffer, whichever is smaller).
             assert_eq!(rxq.used.ring[0].get().len, 1234);
@@ -1469,9 +1651,10 @@ mod tests {
 
             // this should also be successful
             h.interrupt_evt.write(1).unwrap();
-            h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
+            h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty)
+                .unwrap();
             assert!(h.rx.deferred_frame);
-            assert_eq!(h.interrupt_evt.read(), Ok(2));
+            assert_eq!(h.interrupt_evt.read().unwrap(), 2);
 
             // ... but the following shouldn't, because we emulate receiving much more data than
             // we can fit inside a single descriptor
@@ -1487,7 +1670,7 @@ mod tests {
                 h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty)
             );
             assert!(h.rx.deferred_frame);
-            assert_eq!(h.interrupt_evt.read(), Ok(2));
+            assert_eq!(h.interrupt_evt.read().unwrap(), 2);
 
             // A mismatch shows the reception was unsuccessful.
             assert_ne!(rxq.used.ring[0].get().len as usize, h.rx.bytes_read);
@@ -1504,8 +1687,9 @@ mod tests {
 
             h.rx.queue_evt.write(1).unwrap();
             h.interrupt_evt.write(1).unwrap();
-            h.handle_event(RX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty);
-            assert_eq!(h.interrupt_evt.read(), Ok(2));
+            h.handle_event(RX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty)
+                .unwrap();
+            assert_eq!(h.interrupt_evt.read().unwrap(), 2);
         }
 
         {
@@ -1546,7 +1730,8 @@ mod tests {
             {
                 // trigger the TX handler
                 h.tx.queue_evt.write(1).unwrap();
-                h.handle_event(TX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(TX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
 
                 // assert that limiter is blocked
                 assert!(h.get_tx_rate_limiter().is_blocked());
@@ -1560,7 +1745,8 @@ mod tests {
 
             // following TX procedure should succeed because bandwidth should now be available
             {
-                h.handle_event(TX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(TX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
                 // validate the rate_limiter is no longer blocked
                 assert!(!h.get_tx_rate_limiter().is_blocked());
                 // make sure the data queue advanced
@@ -1589,13 +1775,14 @@ mod tests {
                 // leave at least one event here so that reading it later won't block
                 h.interrupt_evt.write(1).unwrap();
                 // trigger the RX handler
-                h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
 
                 // assert that limiter is blocked
                 assert!(h.get_rx_rate_limiter().is_blocked());
                 assert!(h.rx.deferred_frame);
                 // assert that no operation actually completed (limiter blocked it)
-                assert_eq!(h.interrupt_evt.read(), Ok(1));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 1);
                 // make sure the data is still queued for processing
                 assert_eq!(rxq.used.idx.get(), 0);
             }
@@ -1608,11 +1795,12 @@ mod tests {
             {
                 // leave at least one event here so that reading it later won't block
                 h.interrupt_evt.write(1).unwrap();
-                h.handle_event(RX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(RX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
                 // validate the rate_limiter is no longer blocked
                 assert!(!h.get_rx_rate_limiter().is_blocked());
                 // make sure the virtio queue operation completed this time
-                assert_eq!(h.interrupt_evt.read(), Ok(2));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 2);
                 // make sure the data queue advanced
                 assert_eq!(rxq.used.idx.get(), 1);
                 // The #cfg(test) enabled version of read_tap always returns 1234 bytes
@@ -1649,7 +1837,8 @@ mod tests {
             {
                 // trigger the TX handler
                 h.tx.queue_evt.write(1).unwrap();
-                h.handle_event(TX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(TX_QUEUE_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
 
                 // assert that limiter is blocked
                 assert!(h.get_tx_rate_limiter().is_blocked());
@@ -1663,7 +1852,8 @@ mod tests {
 
             // following TX procedure should succeed because ops should now be available
             {
-                h.handle_event(TX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(TX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
                 // validate the rate_limiter is no longer blocked
                 assert!(!h.get_tx_rate_limiter().is_blocked());
                 // make sure the data queue advanced
@@ -1692,22 +1882,24 @@ mod tests {
                 // leave at least one event here so that reading it later won't block
                 h.interrupt_evt.write(1).unwrap();
                 // trigger the RX handler
-                h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
 
                 // assert that limiter is blocked
                 assert!(h.get_rx_rate_limiter().is_blocked());
                 assert!(h.rx.deferred_frame);
                 // assert that no operation actually completed (limiter blocked it)
-                assert_eq!(h.interrupt_evt.read(), Ok(1));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 1);
                 // make sure the data is still queued for processing
                 assert_eq!(rxq.used.idx.get(), 0);
 
                 // leave at least one event here so that reading it later won't block
                 h.interrupt_evt.write(1).unwrap();
                 // trigger the RX handler again, this time it should do the limiter fast path exit
-                h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
                 // assert that no operation actually completed, that the limiter blocked it
-                assert_eq!(h.interrupt_evt.read(), Ok(1));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 1);
                 // make sure the data is still queued for processing
                 assert_eq!(rxq.used.idx.get(), 0);
             }
@@ -1720,9 +1912,10 @@ mod tests {
             {
                 // leave at least one event here so that reading it later won't block
                 h.interrupt_evt.write(1).unwrap();
-                h.handle_event(RX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty);
+                h.handle_event(RX_RATE_LIMITER_EVENT, 0, EpollHandlerPayload::Empty)
+                    .unwrap();
                 // make sure the virtio queue operation completed this time
-                assert_eq!(h.interrupt_evt.read(), Ok(2));
+                assert_eq!(h.interrupt_evt.read().unwrap(), 2);
                 // make sure the data queue advanced
                 assert_eq!(rxq.used.idx.get(), 1);
                 // The #cfg(test) enabled version of read_tap always returns 1234 bytes
@@ -1730,5 +1923,42 @@ mod tests {
                 assert_eq!(rxq.used.ring[0].get().len, 1234);
             }
         }
+    }
+
+    #[test]
+    fn test_patch_rate_limiters() {
+        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut h, _, _) = default_test_netepollhandler(&mem, TestMutators::default());
+
+        h.set_rx_rate_limiter(RateLimiter::new(10, None, 10, 2, None, 2).unwrap());
+        h.set_tx_rate_limiter(RateLimiter::new(10, None, 10, 2, None, 2).unwrap());
+
+        let rx_bytes = TokenBucket::new(1000, Some(1001), 1002);
+        let rx_ops = TokenBucket::new(1003, Some(1004), 1005);
+        let tx_bytes = TokenBucket::new(1006, Some(1007), 1008);
+        let tx_ops = TokenBucket::new(1009, Some(1010), 1011);
+
+        h.handle_event(
+            PATCH_RATE_LIMITERS_FAKE_EVENT,
+            0,
+            EpollHandlerPayload::NetRateLimiterPayload {
+                rx_bytes: Some(rx_bytes.clone()),
+                rx_ops: Some(rx_ops.clone()),
+                tx_bytes: Some(tx_bytes.clone()),
+                tx_ops: Some(tx_ops.clone()),
+            },
+        )
+        .unwrap();
+
+        let compare_buckets = |a: &TokenBucket, b: &TokenBucket| {
+            assert_eq!(a.capacity(), b.capacity());
+            assert_eq!(a.one_time_burst(), b.one_time_burst());
+            assert_eq!(a.refill_time_ms(), b.refill_time_ms());
+        };
+
+        compare_buckets(h.get_rx_rate_limiter().bandwidth().unwrap(), &rx_bytes);
+        compare_buckets(h.get_rx_rate_limiter().ops().unwrap(), &rx_ops);
+        compare_buckets(h.get_tx_rate_limiter().bandwidth().unwrap(), &tx_bytes);
+        compare_buckets(h.get_tx_rate_limiter().ops().unwrap(), &tx_ops);
     }
 }

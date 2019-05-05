@@ -1,6 +1,10 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Exposes simple TCP over IPv4 listener functionality via the [`TcpIPv4Handler`] structure.
+//!
+//! [`TcpIPv4Handler`]: struct.TcpIPv4Handler.html
+
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
@@ -13,35 +17,63 @@ use tcp::{NextSegmentStatus, RstConfig};
 
 // TODO: This is currently IPv4 specific. Maybe change it to a more generic implementation.
 
-// When sending or receiving segments, we may encounter events such as connections being added or
-// removed, and others. The following two enums represent any such occurrences when receiving
-// or writing segments.
+/// Describes events which may occur when the handler receives packets.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum RecvEvent {
+    /// The local endpoint is done communicating, and has been removed.
     EndpointDone,
+    /// An error occurred while trying to create a new `Endpoint` object, based on an incoming
+    /// `SYN` segment.
     FailedNewConnection,
+    /// A new local `Endpoint` has been successfully created.
     NewConnectionSuccessful,
+    /// Failed to add a local `Endpoint` because the handler is already at the maximum number of
+    /// concurrent connections, and there are no evictable Endpoints.
     NewConnectionDropped,
+    /// A new local `Endpoint` has been successfully created, but the handler had to make room by
+    /// evicting an older `Endpoint`.
     NewConnectionReplacing,
+    /// Nothing interesting happened regarding the state of the handler.
     Nothing,
+    /// The handler received a non-`SYN` segment which does not belong to any existing
+    /// connection.
     UnexpectedSegment,
 }
 
+/// Describes events which may occur when the handler writes packets.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum WriteEvent {
+    /// The local `Endpoint` transitioned to being done after this segment was written.
     EndpointDone,
+    /// Nothing interesting happened.
     Nothing,
 }
 
+/// Describes errors which may be encountered by the [`receive_packet`] method from
+/// [`TcpIPv4Handler`].
+///
+/// [`receive_packet`]: struct.TcpIPv4Handler.html#method.receive_packet
+/// [`TcpIPv4Handler`]: struct.TcpIPv4Handler.html
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum RecvError {
+    /// The packet has an invalid destination address.
+    InvalidAddress,
+    /// The inner segment has an invalid destination port.
     InvalidPort,
+    /// The handler encountered an error while parsing the inner TCP segment.
     TcpSegment(TcpSegmentError),
 }
 
+/// Describes errors which may be encountered by the [`write_next_packet`] method from
+/// [`TcpIPv4Handler`].
+///
+/// [`write_next_packet`]: struct.TcpIPv4Handler.html#method.write_next_packet
+/// [`TcpIPv4Handler`]: struct.TcpIPv4Handler.html
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum WriteNextError {
+    /// There was an error while writing the contents of the IPv4 packet.
     IPv4Packet(IPv4PacketError),
+    /// There was an error while writing the contents of the inner TCP segment.
     TcpSegment(TcpSegmentError),
 }
 
@@ -64,6 +96,31 @@ impl ConnectionTuple {
     }
 }
 
+/// Implements a minimalist TCP over IPv4 listener.
+///
+/// Forwards incoming TCP segments to the appropriate connection object, based on the associated
+/// tuple, or attempts to establish new connections (when receiving `SYN` segments). Aside from
+/// constructors, the handler operation is based on three methods:
+///
+/// * [`receive_packet`] examines an incoming IPv4 packet. It checks whether the destination
+///   address is correct, the attempts examine the inner TCP segment, making sure the destination
+///   port number is also correct. Then, it steers valid segments towards exiting connections,
+///   creates new connections for incoming `SYN` segments, and enqueues `RST` replies in response
+///   to any segments which cannot be associated with a connection (except other `RST` segments).
+///   On success, also describes any internal status changes triggered by the reception of the
+///   packet.
+/// * [`write_next_packet`] writes the next IPv4 packet (if available) that would be sent by the
+///   handler itself (right now it can only mean an enqueued `RST`), or one of the existing
+///   connections. On success, also describes any internal status changes triggered as the packet
+///   gets transmitted.
+/// * [`next_segment_status`] describes whether the handler can send a packet immediately, or
+///   after some retransmission timeout associated with a connection fires, or if there's nothing
+///   to send for the moment. This is used to determine whether it's appropriate to call
+///   [`write_next_packet`].
+///
+/// [`receive_packet`]: ../handler/struct.TcpIPv4Handler.html#method.receive_packet
+/// [`write_next_packet`]: ../handler/struct.TcpIPv4Handler.html#method.write_next_packet
+/// [`next_segment_status`]: ../handler/struct.TcpIPv4Handler.html#method.next_segment_status
 pub struct TcpIPv4Handler {
     local_addr: Ipv4Addr,
     local_port: u16,
@@ -74,7 +131,7 @@ pub struct TcpIPv4Handler {
     // Holds connections which are able to send segments immediately.
     active_connections: HashSet<ConnectionTuple>,
     // Remembers the closest timestamp into the future when one of the connections has to deal
-    // with a RTO trigger.
+    // with an RTO trigger.
     next_timeout: Option<(u64, ConnectionTuple)>,
     // RST segments awaiting to be sent.
     rst_queue: Vec<(ConnectionTuple, RstConfig)>,
@@ -92,8 +149,11 @@ enum RecvSegmentOutcome {
 }
 
 impl TcpIPv4Handler {
-    // Max_connections represents the maximum number of concurrent connections we are willing
-    // to accept/handle.
+    /// Creates a new `TcpIPv4Handler`.
+    ///
+    /// The handler acts as if bound to `local_addr`:`local_port`, and will accept at most
+    /// `max_connections` concurrent connections. `RST` segments generated by unexpected incoming
+    /// segments are placed in a queue which is at most `max_pending_resets` long.
     #[inline]
     pub fn new(
         local_addr: Ipv4Addr,
@@ -115,10 +175,17 @@ impl TcpIPv4Handler {
         }
     }
 
+    /// Contains logic for handling incoming segments.
+    ///
+    /// Any changes to the state if the handler are communicated through an `Ok(RecvEvent)`.
     pub fn receive_packet<T: NetworkBytes>(
         &mut self,
         packet: &IPv4Packet<T>,
     ) -> Result<RecvEvent, RecvError> {
+        if packet.destination_address() != self.local_addr {
+            return Err(RecvError::InvalidAddress);
+        }
+
         // TODO: We skip verifying the checksum, just in case the device model relies on offloading
         // checksum computation from the guest to some other entity. Clear this up at some point!
         // (Issue #520)
@@ -149,16 +216,16 @@ impl TcpIPv4Handler {
 
         match outcome {
             RecvSegmentOutcome::EndpointDone => {
-                self.remove_connection(&tuple);
-                return Ok(RecvEvent::EndpointDone);
+                self.remove_connection(tuple);
+                Ok(RecvEvent::EndpointDone)
             }
             RecvSegmentOutcome::EndpointRunning(status) => {
-                if !self.check_next_segment_status(&tuple, status) {
+                if !self.check_next_segment_status(tuple, status) {
                     // The connection may not have been a member of active_connection, but it's
                     // more straightforward to cover both cases this way.
                     self.active_connections.remove(&tuple);
                 }
-                return Ok(RecvEvent::Nothing);
+                Ok(RecvEvent::Nothing)
             }
             RecvSegmentOutcome::NewConnection => {
                 let endpoint = match Endpoint::new_with_defaults(&segment) {
@@ -168,41 +235,37 @@ impl TcpIPv4Handler {
 
                 if self.connections.len() >= self.max_connections {
                     if let Some(evict_tuple) = self.find_evictable_connection() {
-                        // The unwrap() is safe because evict_tuple must be present as a key.
-                        let rst_config = self
-                            .connections
-                            .get(&evict_tuple)
-                            .unwrap()
+                        let rst_config = self.connections[&evict_tuple]
                             .connection()
                             .make_rst_config();
-                        self.enqueue_rst_config(&evict_tuple, rst_config);
-                        self.remove_connection(&evict_tuple);
+                        self.enqueue_rst_config(evict_tuple, rst_config);
+                        self.remove_connection(evict_tuple);
                         self.add_connection(tuple, endpoint);
                         return Ok(RecvEvent::NewConnectionReplacing);
                     } else {
                         // No room to accept the new connection. Try to enqueue a RST, and forget
                         // about it.
-                        self.enqueue_rst(&tuple, &segment);
+                        self.enqueue_rst(tuple, &segment);
                         return Ok(RecvEvent::NewConnectionDropped);
                     }
                 } else {
                     self.add_connection(tuple, endpoint);
-                    return Ok(RecvEvent::NewConnectionSuccessful);
+                    Ok(RecvEvent::NewConnectionSuccessful)
                 }
             }
             RecvSegmentOutcome::UnexpectedSegment(enqueue_rst) => {
                 if enqueue_rst {
-                    self.enqueue_rst(&tuple, &segment);
+                    self.enqueue_rst(tuple, &segment);
                 }
-                return Ok(RecvEvent::UnexpectedSegment);
+                Ok(RecvEvent::UnexpectedSegment)
             }
         }
     }
 
-    fn check_timeout(&mut self, value: u64, tuple: &ConnectionTuple) {
+    fn check_timeout(&mut self, value: u64, tuple: ConnectionTuple) {
         match self.next_timeout {
-            Some((t, _)) if t > value => self.next_timeout = Some((value, *tuple)),
-            None => self.next_timeout = Some((value, *tuple)),
+            Some((t, _)) if t > value => self.next_timeout = Some((value, tuple)),
+            None => self.next_timeout = Some((value, tuple)),
             _ => (),
         };
     }
@@ -227,17 +290,17 @@ impl TcpIPv4Handler {
     // been there already).
     fn check_next_segment_status(
         &mut self,
-        tuple: &ConnectionTuple,
+        tuple: ConnectionTuple,
         status: NextSegmentStatus,
     ) -> bool {
         if let Some((_, timeout_tuple)) = self.next_timeout {
-            if *tuple == timeout_tuple {
+            if tuple == timeout_tuple {
                 self.find_next_timeout();
             }
         }
         match status {
             NextSegmentStatus::Available => {
-                self.active_connections.insert(*tuple);
+                self.active_connections.insert(tuple);
                 return true;
             }
             NextSegmentStatus::Timeout(value) => self.check_timeout(value, tuple),
@@ -247,17 +310,17 @@ impl TcpIPv4Handler {
     }
 
     fn add_connection(&mut self, tuple: ConnectionTuple, endpoint: Endpoint) {
-        self.check_next_segment_status(&tuple, endpoint.next_segment_status());
+        self.check_next_segment_status(tuple, endpoint.next_segment_status());
         self.connections.insert(tuple, endpoint);
     }
 
-    fn remove_connection(&mut self, tuple: &ConnectionTuple) {
+    fn remove_connection(&mut self, tuple: ConnectionTuple) {
         // Just in case it's in there somewhere.
-        self.active_connections.remove(tuple);
-        self.connections.remove(tuple);
+        self.active_connections.remove(&tuple);
+        self.connections.remove(&tuple);
 
         if let Some((_, timeout_tuple)) = self.next_timeout {
-            if timeout_tuple == *tuple {
+            if timeout_tuple == tuple {
                 self.find_next_timeout();
             }
         }
@@ -273,17 +336,24 @@ impl TcpIPv4Handler {
         None
     }
 
-    fn enqueue_rst_config(&mut self, tuple: &ConnectionTuple, cfg: RstConfig) {
+    fn enqueue_rst_config(&mut self, tuple: ConnectionTuple, cfg: RstConfig) {
         // We simply forgo sending any RSTs if the queue is already full.
         if self.rst_queue.len() < self.max_pending_resets {
-            self.rst_queue.push((*tuple, cfg));
+            self.rst_queue.push((tuple, cfg));
         }
     }
 
-    fn enqueue_rst<T: NetworkBytes>(&mut self, tuple: &ConnectionTuple, s: &TcpSegment<T>) {
+    fn enqueue_rst<T: NetworkBytes>(&mut self, tuple: ConnectionTuple, s: &TcpSegment<T>) {
         self.enqueue_rst_config(tuple, RstConfig::new(&s));
     }
 
+    /// Attempts to write one packet, from either the `RST` queue or one of the existing endpoints,
+    /// to `buf`.
+    ///
+    /// On success, the function returns a pair containing an `Option<NonZeroUsize>` and a
+    /// `WriteEvent`. The options represents how many bytes have been written to `buf`, or
+    /// that no packet can be send presently (when equal to `None`). The `WriteEvent` describes
+    /// whether any noteworthy state changes are associated with the write.
     pub fn write_next_packet(
         &mut self,
         buf: &mut [u8],
@@ -380,13 +450,13 @@ impl TcpIPv4Handler {
 
         if let Some((tuple, is_done)) = writer_status {
             if is_done {
-                self.remove_connection(&tuple);
+                self.remove_connection(tuple);
                 event = WriteEvent::EndpointDone;
             } else {
                 // The unwrap is safe because tuple is present as a key in self.connections if we
                 // got here.
-                let status = self.connections.get(&tuple).unwrap().next_segment_status();
-                if !self.check_next_segment_status(&tuple, status) {
+                let status = self.connections[&tuple].next_segment_status();
+                if !self.check_next_segment_status(tuple, status) {
                     self.active_connections.remove(&tuple);
                 }
             }
@@ -395,6 +465,7 @@ impl TcpIPv4Handler {
         Ok((len, event))
     }
 
+    /// Describes the status of the next segment to be sent by the handler.
     #[inline]
     pub fn next_segment_status(&self) -> NextSegmentStatus {
         if !self.active_connections.is_empty() || !self.rst_queue.is_empty() {
@@ -421,6 +492,7 @@ mod tests {
         TcpSegment::from_bytes(p.payload_mut(), None).unwrap()
     }
 
+    #[allow(clippy::type_complexity)]
     fn write_next<'a>(
         h: &mut TcpIPv4Handler,
         buf: &'a mut [u8],
@@ -475,10 +547,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn test_handler() {
         let mut buf = [0u8; 100];
         let mut buf2 = [0u8; 2000];
 
+        let wrong_local_addr = Ipv4Addr::new(123, 123, 123, 123);
         let local_addr = Ipv4Addr::new(169, 254, 169, 254);
         let local_port = 80;
         let remote_addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -493,10 +567,11 @@ mod tests {
             NonZeroUsize::new(max_pending_resets).unwrap(),
         );
 
-        // We set the proper value of dst_addr from the start, because the TcpHandler expects this
-        // check to be made before receiving the packet.
+        // We start with a wrong destination address and destination port to check those error
+        // conditions first.
         let mut p =
-            IPv4Packet::write_header(buf.as_mut(), PROTOCOL_TCP, remote_addr, local_addr).unwrap();
+            IPv4Packet::write_header(buf.as_mut(), PROTOCOL_TCP, remote_addr, wrong_local_addr)
+                .unwrap();
 
         let seq_number = 123;
 
@@ -525,6 +600,9 @@ mod tests {
         assert_eq!(drain_packets(&mut h, remote_addr), Ok(0));
 
         let mut p = p.with_payload_len_unchecked(s_len, false);
+
+        assert_eq!(h.receive_packet(&p).unwrap_err(), RecvError::InvalidAddress);
+        p.set_destination_address(local_addr);
         assert_eq!(h.receive_packet(&p).unwrap_err(), RecvError::InvalidPort);
 
         // Let's fix the port. However, the segment is not a valid SYN, so we should get an
@@ -619,13 +697,7 @@ mod tests {
 
         // Let's ACK the SYNACK.
         {
-            let seq = h
-                .connections
-                .get(&remote_tuple)
-                .unwrap()
-                .connection()
-                .first_not_sent()
-                .0;
+            let seq = h.connections[&remote_tuple].connection().first_not_sent().0;
             inner_tcp_mut(&mut p)
                 .set_flags_after_ns(TcpFlags::ACK)
                 .set_ack_number(seq);
